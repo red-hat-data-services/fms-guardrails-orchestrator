@@ -15,129 +15,101 @@
 
 */
 
-use std::collections::HashMap;
+use std::fmt::Debug;
 
-use serde::{Deserialize, Serialize};
+use axum::http::HeaderMap;
+use http::header::CONTENT_TYPE;
+use hyper::StatusCode;
+use serde::Deserialize;
+use tracing::instrument;
+use url::Url;
 
-use super::{create_http_clients, Error, HttpClient};
-use crate::config::ServiceConfig;
+use super::{
+    http::{HttpClientExt, RequestBody, ResponseBody},
+    Error,
+};
 
-const DETECTOR_ID_HEADER_NAME: &str = "detector-id";
+pub mod text_contents;
+pub use text_contents::*;
+pub mod text_chat;
+pub use text_chat::*;
+pub mod text_context_doc;
+pub use text_context_doc::*;
+pub mod text_generation;
+pub use text_generation::*;
 
-// For some reason the order matters here. #[cfg_attr(test, derive(Default), faux::create)] doesn't work. (rustc --explain E0560)
-#[cfg_attr(test, faux::create, derive(Default))]
-#[derive(Clone)]
-pub struct DetectorClient {
-    clients: HashMap<String, HttpClient>,
+const DEFAULT_PORT: u16 = 8080;
+pub const DETECTOR_ID_HEADER_NAME: &str = "detector-id";
+const MODEL_HEADER_NAME: &str = "x-model-name";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DetectorError {
+    pub code: u16,
+    pub message: String,
 }
 
-#[cfg_attr(test, faux::methods)]
-impl DetectorClient {
-    pub async fn new(default_port: u16, config: &[(String, ServiceConfig)]) -> Self {
-        let clients: HashMap<String, HttpClient> = create_http_clients(default_port, config).await;
-        Self { clients }
+impl From<DetectorError> for Error {
+    fn from(error: DetectorError) -> Self {
+        Error::Http {
+            code: StatusCode::from_u16(error.code).unwrap(),
+            message: error.message,
+        }
     }
+}
 
-    fn client(&self, model_id: &str) -> Result<HttpClient, Error> {
-        Ok(self
-            .clients
-            .get(model_id)
-            .ok_or_else(|| Error::ModelNotFound {
-                model_id: model_id.to_string(),
-            })?
-            .clone())
-    }
+/// This trait should be implemented by all detectors.
+/// If the detector has an HTTP client (currently all detector clients are HTTP) this trait will
+/// implicitly extend the client with an HTTP detector specific post function.
+pub trait DetectorClient {}
 
-    pub async fn text_contents(
+/// Provides a helper extension for HTTP detector clients.
+pub trait DetectorClientExt: HttpClientExt {
+    /// Wraps the post function with extra detector functionality
+    /// (detector id header injection & error handling)
+    async fn post_to_detector<U: ResponseBody>(
         &self,
         model_id: &str,
-        request: ContentAnalysisRequest,
-    ) -> Result<Vec<Vec<ContentAnalysisResponse>>, Error> {
-        let client = self.client(model_id)?;
-        let url = client.base_url().as_str();
-        let response = client
-            .post(url)
-            .header(DETECTOR_ID_HEADER_NAME, model_id)
-            .json(&request)
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(response)
-    }
+        url: Url,
+        headers: HeaderMap,
+        request: impl RequestBody,
+    ) -> Result<U, Error>;
+
+    /// Wraps call to inner HTTP client endpoint function.
+    fn endpoint(&self, path: &str) -> Url;
 }
 
-/// Request for text content analysis
-/// Results of this request will contain analysis / detection of each of the provided documents
-/// in the order they are present in the `contents` object.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ContentAnalysisRequest {
-    /// Field allowing users to provide list of documents for analysis
-    pub contents: Vec<String>,
-}
+impl<C: DetectorClient + HttpClientExt> DetectorClientExt for C {
+    #[instrument(skip_all, fields(model_id, url))]
+    async fn post_to_detector<U: ResponseBody>(
+        &self,
+        model_id: &str,
+        url: Url,
+        headers: HeaderMap,
+        request: impl RequestBody,
+    ) -> Result<U, Error> {
+        let mut headers = headers;
+        headers.append(DETECTOR_ID_HEADER_NAME, model_id.parse().unwrap());
+        headers.append(CONTENT_TYPE, "application/json".parse().unwrap());
+        // Header used by a router component, if available
+        headers.append(MODEL_HEADER_NAME, model_id.parse().unwrap());
 
-impl ContentAnalysisRequest {
-    pub fn new(contents: Vec<String>) -> ContentAnalysisRequest {
-        ContentAnalysisRequest { contents }
-    }
-}
+        let response = self.inner().post(url, headers, request).await?;
 
-/// Evidence type
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum EvidenceType {
-    Url,
-    Title,
-}
-
-/// Source of the evidence e.g. url
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Evidence {
-    /// Evidence source
-    pub source: String,
-}
-
-/// Evidence in response
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EvidenceObj {
-    /// Type field signifying the type of evidence provided
-    #[serde(rename = "type")]
-    pub r#type: EvidenceType,
-    /// Evidence currently only containing source
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<Evidence>,
-}
-
-/// Response of text content analysis endpoint
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ContentAnalysisResponse {
-    /// Start index of detection
-    pub start: usize,
-    /// End index of detection
-    pub end: usize,
-    /// Text corresponding to detection
-    pub text: String,
-    /// Relevant detection class
-    pub detection: String,
-    /// Detection type or aggregate detection label
-    pub detection_type: String,
-    /// Score of detection
-    pub score: f64,
-    /// Optional, any applicable evidences for detection
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidences: Option<Vec<EvidenceObj>>,
-}
-
-impl From<ContentAnalysisResponse> for crate::models::TokenClassificationResult {
-    fn from(value: ContentAnalysisResponse) -> Self {
-        Self {
-            start: value.start as u32,
-            end: value.end as u32,
-            word: value.text,
-            entity: value.detection,
-            entity_group: value.detection_type,
-            score: value.score,
-            token_count: None,
+        let status = response.status();
+        match status {
+            StatusCode::OK => Ok(response.json().await?),
+            _ => Err(response
+                .json::<DetectorError>()
+                .await
+                .unwrap_or(DetectorError {
+                    code: status.as_u16(),
+                    message: "".into(),
+                })
+                .into()),
         }
+    }
+
+    fn endpoint(&self, path: &str) -> Url {
+        self.inner().endpoint(path)
     }
 }

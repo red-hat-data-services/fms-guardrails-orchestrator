@@ -15,13 +15,14 @@
 
 */
 
-use std::pin::Pin;
+use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
+use hyper::HeaderMap;
+use tracing::{debug, instrument};
 
-use futures::{Stream, StreamExt};
-use tracing::debug;
-
-use super::{Error, NlpClient, TgisClient};
+use super::{BoxStream, Client, Error, NlpClient, TgisClient};
 use crate::{
+    health::HealthCheckResult,
     models::{
         ClassifiedGeneratedTextResult, ClassifiedGeneratedTextStreamResult,
         GuardrailsTextGenerationParameters,
@@ -40,7 +41,7 @@ use crate::{
 
 #[cfg_attr(test, faux::create)]
 #[derive(Clone)]
-pub struct GenerationClient(GenerationClientInner);
+pub struct GenerationClient(Option<GenerationClientInner>);
 
 #[derive(Clone)]
 enum GenerationClientInner {
@@ -51,20 +52,26 @@ enum GenerationClientInner {
 #[cfg_attr(test, faux::methods)]
 impl GenerationClient {
     pub fn tgis(client: TgisClient) -> Self {
-        Self(GenerationClientInner::Tgis(client))
+        Self(Some(GenerationClientInner::Tgis(client)))
     }
 
     pub fn nlp(client: NlpClient) -> Self {
-        Self(GenerationClientInner::Nlp(client))
+        Self(Some(GenerationClientInner::Nlp(client)))
     }
 
+    pub fn not_configured() -> Self {
+        Self(None)
+    }
+
+    #[instrument(skip_all, fields(model_id))]
     pub async fn tokenize(
         &self,
         model_id: String,
         text: String,
+        headers: HeaderMap,
     ) -> Result<(u32, Vec<String>), Error> {
         match &self.0 {
-            GenerationClientInner::Tgis(client) => {
+            Some(GenerationClientInner::Tgis(client)) => {
                 let request = BatchedTokenizeRequest {
                     model_id: model_id.clone(),
                     requests: vec![TokenizeRequest { text }],
@@ -72,17 +79,19 @@ impl GenerationClient {
                     return_offsets: false,
                     truncate_input_tokens: 0,
                 };
-                debug!(%model_id, provider = "tgis", ?request, "sending tokenize request");
-                let mut response = client.tokenize(request).await?;
-                debug!(%model_id, provider = "tgis", ?response, "received tokenize response");
+                debug!(provider = "tgis", ?request, "sending tokenize request");
+                let mut response = client.tokenize(request, headers).await?;
+                debug!(provider = "tgis", ?response, "received tokenize response");
                 let response = response.responses.swap_remove(0);
                 Ok((response.token_count, response.tokens))
             }
-            GenerationClientInner::Nlp(client) => {
+            Some(GenerationClientInner::Nlp(client)) => {
                 let request = TokenizationTaskRequest { text };
-                debug!(%model_id, provider = "nlp", ?request, "sending tokenize request");
-                let response = client.tokenization_task_predict(&model_id, request).await?;
-                debug!(%model_id, provider = "nlp", ?response, "received tokenize response");
+                debug!(provider = "nlp", ?request, "sending tokenize request");
+                let response = client
+                    .tokenization_task_predict(&model_id, request, headers)
+                    .await?;
+                debug!(provider = "nlp", ?response, "received tokenize response");
                 let tokens = response
                     .results
                     .into_iter()
@@ -90,17 +99,20 @@ impl GenerationClient {
                     .collect::<Vec<_>>();
                 Ok((response.token_count as u32, tokens))
             }
+            None => Err(Error::ModelNotFound { model_id }),
         }
     }
 
+    #[instrument(skip_all, fields(model_id))]
     pub async fn generate(
         &self,
         model_id: String,
         text: String,
         params: Option<GuardrailsTextGenerationParameters>,
+        headers: HeaderMap,
     ) -> Result<ClassifiedGeneratedTextResult, Error> {
         match &self.0 {
-            GenerationClientInner::Tgis(client) => {
+            Some(GenerationClientInner::Tgis(client)) => {
                 let params = params.map(Into::into);
                 let request = BatchedGenerationRequest {
                     model_id: model_id.clone(),
@@ -108,12 +120,12 @@ impl GenerationClient {
                     requests: vec![GenerationRequest { text }],
                     params,
                 };
-                debug!(%model_id, provider = "tgis", ?request, "sending generate request");
-                let response = client.generate(request).await?;
-                debug!(%model_id, provider = "tgis", ?response, "received generate response");
+                debug!(provider = "tgis", ?request, "sending generate request");
+                let response = client.generate(request, headers).await?;
+                debug!(provider = "tgis", ?response, "received generate response");
                 Ok(response.into())
             }
-            GenerationClientInner::Nlp(client) => {
+            Some(GenerationClientInner::Nlp(client)) => {
                 let request = if let Some(params) = params {
                     TextGenerationTaskRequest {
                         text,
@@ -137,6 +149,7 @@ impl GenerationClient {
                         generated_tokens: params.generated_tokens,
                         token_logprobs: params.token_logprobs,
                         token_ranks: params.token_ranks,
+                        include_stop_sequence: params.include_stop_sequence,
                     }
                 } else {
                     TextGenerationTaskRequest {
@@ -144,25 +157,27 @@ impl GenerationClient {
                         ..Default::default()
                     }
                 };
-                debug!(%model_id, provider = "nlp", ?request, "sending generate request");
+                debug!(provider = "nlp", ?request, "sending generate request");
                 let response = client
-                    .text_generation_task_predict(&model_id, request)
+                    .text_generation_task_predict(&model_id, request, headers)
                     .await?;
-                debug!(%model_id, provider = "nlp", ?response, "received generate response");
+                debug!(provider = "nlp", ?response, "received generate response");
                 Ok(response.into())
             }
+            None => Err(Error::ModelNotFound { model_id }),
         }
     }
 
+    #[instrument(skip_all, fields(model_id))]
     pub async fn generate_stream(
         &self,
         model_id: String,
         text: String,
         params: Option<GuardrailsTextGenerationParameters>,
-    ) -> Result<Pin<Box<dyn Stream<Item = ClassifiedGeneratedTextStreamResult> + Send>>, Error>
-    {
+        headers: HeaderMap,
+    ) -> Result<BoxStream<Result<ClassifiedGeneratedTextStreamResult, Error>>, Error> {
         match &self.0 {
-            GenerationClientInner::Tgis(client) => {
+            Some(GenerationClientInner::Tgis(client)) => {
                 let params = params.map(Into::into);
                 let request = SingleGenerationRequest {
                     model_id: model_id.clone(),
@@ -170,15 +185,19 @@ impl GenerationClient {
                     request: Some(GenerationRequest { text }),
                     params,
                 };
-                debug!(%model_id, provider = "tgis", ?request, "sending generate_stream request");
+                debug!(
+                    provider = "tgis",
+                    ?request,
+                    "sending generate_stream request"
+                );
                 let response_stream = client
-                    .generate_stream(request)
+                    .generate_stream(request, headers)
                     .await?
-                    .map(|resp| resp.into())
+                    .map_ok(Into::into)
                     .boxed();
                 Ok(response_stream)
             }
-            GenerationClientInner::Nlp(client) => {
+            Some(GenerationClientInner::Nlp(client)) => {
                 let request = if let Some(params) = params {
                     ServerStreamingTextGenerationTaskRequest {
                         text,
@@ -202,6 +221,7 @@ impl GenerationClient {
                         generated_tokens: params.generated_tokens,
                         token_logprobs: params.token_logprobs,
                         token_ranks: params.token_ranks,
+                        include_stop_sequence: params.include_stop_sequence,
                     }
                 } else {
                     ServerStreamingTextGenerationTaskRequest {
@@ -209,14 +229,35 @@ impl GenerationClient {
                         ..Default::default()
                     }
                 };
-                debug!(%model_id, provider = "nlp", ?request, "sending generate_stream request");
+                debug!(
+                    provider = "nlp",
+                    ?request,
+                    "sending generate_stream request"
+                );
                 let response_stream = client
-                    .server_streaming_text_generation_task_predict(&model_id, request)
+                    .server_streaming_text_generation_task_predict(&model_id, request, headers)
                     .await?
-                    .map(|resp| resp.into())
+                    .map_ok(Into::into)
                     .boxed();
                 Ok(response_stream)
             }
+            None => Err(Error::ModelNotFound { model_id }),
+        }
+    }
+}
+
+#[cfg_attr(test, faux::methods)]
+#[async_trait]
+impl Client for GenerationClient {
+    fn name(&self) -> &str {
+        "generation"
+    }
+
+    async fn health(&self) -> HealthCheckResult {
+        match &self.0 {
+            Some(GenerationClientInner::Tgis(client)) => client.health().await,
+            Some(GenerationClientInner::Nlp(client)) => client.health().await,
+            None => unimplemented!(),
         }
     }
 }

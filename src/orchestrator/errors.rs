@@ -14,38 +14,33 @@
  limitations under the License.
 
 */
-
-use crate::clients;
+use crate::{clients, models::ValidationError};
 
 /// Orchestrator errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Error {
-    #[error("detector not found: {detector_id}")]
-    DetectorNotFound { detector_id: String },
-    #[error("detector request failed for detector_id={detector_id}: {error}")]
-    DetectorRequestFailed {
-        detector_id: String,
-        error: clients::Error,
-    },
-    #[error("chunker request failed for chunker_id={chunker_id}: {error}")]
-    ChunkerRequestFailed {
-        chunker_id: String,
-        error: clients::Error,
-    },
-    #[error("generate request failed for model_id={model_id}: {error}")]
-    GenerateRequestFailed {
-        model_id: String,
-        error: clients::Error,
-    },
-    #[error("tokenize request failed for model_id={model_id}: {error}")]
-    TokenizeRequestFailed {
-        model_id: String,
-        error: clients::Error,
-    },
-    #[error("task cancelled")]
-    Cancelled,
+    #[error(transparent)]
+    Client(#[from] clients::Error),
+    #[error("detector `{0}` not found")]
+    DetectorNotFound(String),
+    #[error("detector request failed for `{id}`: {error}")]
+    DetectorRequestFailed { id: String, error: clients::Error },
+    #[error("chunker request failed for `{id}`: {error}")]
+    ChunkerRequestFailed { id: String, error: clients::Error },
+    #[error("generate request failed for `{id}`: {error}")]
+    GenerateRequestFailed { id: String, error: clients::Error },
+    #[error("chat generation request failed for `{id}`: {error}")]
+    ChatGenerateRequestFailed { id: String, error: clients::Error },
+    #[error("tokenize request failed for `{id}`: {error}")]
+    TokenizeRequestFailed { id: String, error: clients::Error },
+    #[error("validation error: {0}")]
+    Validation(String),
     #[error("{0}")]
     Other(String),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("json deserialization error: {0}")]
+    JsonError(String),
 }
 
 impl From<tokio::task::JoinError> for Error {
@@ -55,5 +50,17 @@ impl From<tokio::task::JoinError> for Error {
         } else {
             Self::Other(format!("task panicked: {error}"))
         }
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Self::JsonError(value.to_string())
+    }
+}
+
+impl From<ValidationError> for Error {
+    fn from(value: ValidationError) -> Self {
+        Self::Validation(value.to_string())
     }
 }

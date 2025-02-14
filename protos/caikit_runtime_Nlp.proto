@@ -8,6 +8,7 @@
  import "google/protobuf/struct.proto";
  import "caikit_data_model_nlp.proto";
  import "caikit_data_model_caikit_nlp.proto";
+ import "health_check.proto";
 
 
  /*-- MESSAGES ----------------------------------------------------------------*/
@@ -34,6 +35,7 @@
    optional bool generated_tokens = 17;
    optional bool token_logprobs = 18;
    optional bool token_ranks = 19;
+   optional bool include_stop_sequence = 20;
  }
 
  message TextGenerationTaskRequest {
@@ -58,6 +60,7 @@
    optional bool generated_tokens = 17;
    optional bool token_logprobs = 18;
    optional bool token_ranks = 19;
+   optional bool include_stop_sequence = 20;
  }
 
  message TokenizationTaskRequest {

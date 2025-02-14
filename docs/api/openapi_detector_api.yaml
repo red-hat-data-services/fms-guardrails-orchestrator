@@ -1,13 +1,18 @@
 openapi: 3.0.1
 info:
-  title: Detectors API (WIP)
+  title: Detectors API
   license:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   version: 0.0.1
+tags:
+  - name: Text
+    description: Detections on text
 paths:
   /api/v1/text/contents:
     post:
+      tags:
+        - Text
       summary: Text Content Analysis Unary Handler
       description: >-
         Detectors that work on content text, be it user prompt or generated
@@ -67,6 +72,8 @@ paths:
                 $ref: '#/components/schemas/Error'
   /api/v1/text/generation:
     post:
+      tags:
+        - Text
       summary: Generation Analysis Unary Handler
       description: >-
         Detectors that run on prompt and text generation output.  <br>
@@ -113,12 +120,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /api/v1/text/context/chat:
+  /api/v1/text/chat:
     post:
+      tags:
+        - Text
       summary: Chat Analysis Unary Handler
       description: >-
-        Detectors that work on analysis chat history and provide detections <br>
-      operationId: chat_analysis_unary_handler_api_v1_text_context_chat_post
+        Detectors that analyze chat messages and provide detections <br>
+      operationId: chat_analysis_unary_handler_api_v1_text_chat_post
       parameters:
         - name: detector-id
           in: header
@@ -143,15 +152,11 @@ paths:
                 items:
                   $ref: '#/components/schemas/ChatAnalysisResponse'
                 title: >-
-                  Response Chat Analysis Unary Handler Api V1 Text Context Chat
-                  Post
+                  Response Chat Analysis Unary Handler Api V1 Text Chat Post
                 example:
-                  - detection: quantity_1
-                    detection_type: dummy_detector_type
-                    score: 0.68
-                  - detection: quantity_2
-                    detection_type: dummy_detector_type
-                    score: 0.79
+                  - detection: "detection_type"
+                    detection_type: "dummy_detector_type"
+                    score: 0.99
         '404':
           description: Resource Not Found
           content:
@@ -166,6 +171,8 @@ paths:
                 $ref: '#/components/schemas/Error'
   /api/v1/text/context/doc:
     post:
+      tags:
+        - Text
       summary: Context Analysis Unary Handler
       description: >-
         Detectors that work on a context created by document(s).<br>
@@ -200,6 +207,10 @@ paths:
                   - detection: "relevant"
                     detection_type: "dummy_detector_type"
                     score: 0.99
+                    evidence:
+                      - name: "context_chunk"
+                        value: "Context sentence 1"
+                        score: 0.333
         '404':
           description: Resource Not Found
           content:
@@ -212,27 +223,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Performs quick liveliness check of the detector service
+      operationId: health
+      responses:
+        '200':
+          description: Healthy
 components:
   schemas:
     ChatAnalysisHttpRequest:
       properties:
-        chat_history:
-          items:
-            $ref: '#/components/schemas/Message'
+        messages:
+          title: Chat Messages
           type: array
-          title: Chat History
-          example:
-            - content: You are a helpful assistant.
-              author: system
-            - content: Hi, is this powered by siri or alexa?
-              author: user
-            - content: Better, it's watsonx
-              author: assistant
-            - content: This is awesome!
-              author: user
+          items:
+            allOf:
+              - $ref: https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml#/components/schemas/ChatCompletionRequestMessage
+              - type: object
+        detector_params:
+          type: object
+          default: {}
+          title: Detector Parameters
+          description: Optional detector parameters, used on a per-detector basis
       type: object
       required:
-        - chat_history
+        - messages
       title: ChatAnalysisHttpRequest
     ChatAnalysisResponse:
       properties:
@@ -248,12 +266,12 @@ components:
           type: number
           title: Score
           example: 0.684
-        evidences:
+        evidence:
           anyOf:
             - items:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
-          description: Optional field providing evidences for the provided detection
+          description: Optional field providing evidence for the provided detection
       type: object
       required:
         - detection
@@ -280,9 +298,14 @@ components:
           example:
             - https://en.wikipedia.org/wiki/IBM
             - https://research.ibm.com/
+        detector_params:
+          type: object
+          default: {}
+          title: Detector Parameters
+          description: Optional detector parameters, used on a per-detector basis
       type: object
       required:
-        - prompt
+        - content
         - context_type
         - context
       title: ContextAnalysisHttpRequest
@@ -300,12 +323,12 @@ components:
           type: number
           title: Score
           example: 0.5
-        evidences:
+        evidence:
           anyOf:
             - items:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
-          description: Optional field providing evidences for the provided detection
+          description: Optional field providing evidence for the provided detection
       type: object
       required:
         - detection
@@ -347,68 +370,50 @@ components:
         attributes -- see the documentation for details.
     Evidence:
       properties:
-        source:
+        name:
           type: string
-          title: Source
-          description: source of the evidence, it can be url of the evidence etc
-          example: https://en.wikipedia.org/wiki/IBM
+          title: Name
+          description: Name for the evidence
+          example: context_chunk
+        value:
+          type: string
+          title: Value
+          description: Value for the evidence
+          example: one chunk of context
+        score:
+          type: number
+          title: Score
+          example: 0.5
       type: object
       required:
-        - source
+        - name
       title: Evidence
     EvidenceObj:
       properties:
-        type:
-          allOf:
-            - $ref: '#/components/schemas/EvidenceType'
-          description: >-
-            Type field signifying the type of evidence provided. Example url,
-            title etc
-          example: url
+        name:
+          type: string
+          title: Name
+          description: Name for the evidence
+          example: context
+        value:
+          type: string
+          title: Value
+          description: Value for the evidence
+          example: This is one context sentence.
+        score:
+          type: number
+          title: Score
+          example: 0.5
         evidence:
-          allOf:
-            - $ref: '#/components/schemas/Evidence'
-          description: >-
-            Evidence object, currently only containing source, but in future can
-            contain other optional arguments like id, etc
-          example:
-            source: https://en.wikipedia.org/wiki/IBM
+          anyOf:
+            - items:
+                $ref: '#/components/schemas/Evidence'
+              type: array
+          description: Evidence on evidence value
       type: object
       required:
-        - type
+        - name
       title: EvidenceObj
-    EvidenceType:
-      type: string
-      enum:
-        - url
-        - title
-      title: EvidenceType
-      description: >-
-        A collection of name/value pairs.
-
-        Access them by:
-
-        - attribute access::
-
-        >>> EvidenceType.url <EvidenceType.url: 'url'>
-
-        - value lookup:
-
-        >>> EvidenceType('url') <EvidenceType.url: 'url'>
-
-        - name lookup:
-
-        >>> EvidenceType['url'] <EvidenceType.url: 'url'>
-
-        Enumerations can be iterated over, and know how many members they have:
-
-        >>> len(EvidenceType) 2
-
-        >>> list(EvidenceType) [<EvidenceType.url: 'url'>, <EvidenceType.title:
-        'title'>]
-
-        Methods can be added to enumerations, and members can have their own
-        attributes -- see the documentation for details.
     GenerationAnalysisHttpRequest:
       properties:
         prompt:
@@ -421,6 +426,11 @@ components:
           title: Generated Text
           description: Generated response from the LLM
           example: Some text generated by an LLM
+        detector_params:
+          type: object
+          default: {}
+          title: Detector Parameters
+          description: Optional detector parameters, used on a per-detector basis
       type: object
       required:
         - prompt
@@ -440,12 +450,12 @@ components:
           type: number
           title: Score
           example: 0.5
-        evidences:
+        evidence:
           anyOf:
             - items:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
-          description: Optional field providing evidences for the provided detection
+          description: Optional field providing evidence for the provided detection
       type: object
       required:
         - detection
@@ -462,54 +472,6 @@ components:
       required:
         - code
         - message
-    Message:
-      properties:
-        author:
-          allOf:
-            - $ref: '#/components/schemas/AuthorEnum'
-          description: 'Who wrote the message: [<enum ''AuthorEnum''>]'
-        content:
-          type: string
-          title: Content
-          description: The text of the message
-      type: object
-      required:
-        - author
-        - content
-      title: Message
-    AuthorEnum:
-      type: string
-      enum:
-        - system
-        - assistant
-        - user
-      title: AuthorEnum
-      description: >-
-        A collection of name/value pairs.
-
-        Access them by:
-
-        - attribute access::
-
-        >>> AuthorEnum.system <AuthorEnum.system: 'system'>
-
-        - value lookup:
-
-        >>> AuthorEnum('system') <AuthorEnum.system: 'system'>
-
-        - name lookup:
-
-        >>> AuthorEnum['system'] <AuthorEnum.system: 'system'>
-
-        Enumerations can be iterated over, and know how many members they have:
-
-        >>> len(AuthorEnum) 3
-
-        >>> list(AuthorEnum) [<AuthorEnum.system: 'system'>, <AuthorEnum.assistant:
-        'assistant'>, <AuthorEnum.user: 'user'>]
-
-        Methods can be added to enumerations, and members can have their own
-        attributes -- see the documentation for details.
     ContentAnalysisHttpRequest:
       properties:
         contents:
@@ -523,6 +485,11 @@ components:
             example: >-
               Your email is test@ibm.com! Only the next instance of email will be
               processed. test@ibm.com. Your SSN is 123-45-6789.
+        detector_params:
+          type: object
+          default: {}
+          title: Detector Parameters
+          description: Optional detector parameters, used on a per-detector basis
       type: object
       required:
         - contents
@@ -557,12 +524,12 @@ components:
           type: number
           title: Score
           example: 0.8
-        evidences:
+        evidence:
           anyOf:
             - items:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
-          description: Optional field providing evidences for the provided detection
+          description: Optional field providing evidence for the provided detection
       type: object
       required:
         - start

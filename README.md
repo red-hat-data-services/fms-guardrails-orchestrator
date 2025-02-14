@@ -1,8 +1,16 @@
 # FMS Guardrails Orchestrator
 
-Orchestrator server for invocation of detectors on text generation input and output [name subject to change]
+Orchestrator server for invocation of detectors on text generation input and output, and standalone detections
 
 ![LLM Orchestration diagram](docs/architecture/images/llm_detector_orchestration.png "Orchestr8 Diagram")
+
+## APIs
+- [Orchestrator API](https://foundation-model-stack.github.io/fms-guardrails-orchestrator/?urls.primaryName=Orchestrator+API)
+- [Detector API](https://foundation-model-stack.github.io/fms-guardrails-orchestrator/?urls.primaryName=Detector+API) for orchestrator to call detectors with
+
+## Architecture Decision Records (ADRs)
+
+ADRs are used to document the decision-making process for the orchestrator and can be found in the [docs/architecture/adrs directory](docs/architecture/adrs).
 
 ## Getting Started
 
@@ -33,6 +41,7 @@ To run the server locally:
 ```sh
 cargo run --bin fms-guardrails-orchestr8
 ```
+NOTE: To actually try out end-to-end calls locally, the orchestrator needs to have servers to orchestrate, so relevant server configurations have to be provided. For example, invoking any standalone detection endpoints will require configurations for the relevant detector server(s) to be provided, in addition to any of their dependent chunker servers. For any endpoints that require generation, an appropriate generation server should also be provided. An [example configuration](config/config.yaml) is provided with the repository.
 
 To run tests:
 ```sh
@@ -72,6 +81,8 @@ curl -v http://localhost:8034/health
 ```
 
 ### Server configuration
+
+Metrics and traces for observability are gathered through the [OpenTelemetry](https://opentelemetry.io/) framework. Details are provided in [orchestrator's OpenTelemetry reference doc](./docs/open-telemetry.md).
 
 Server configuration args can also be provided through environment variables.
 

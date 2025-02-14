@@ -15,11 +15,16 @@
 
 */
 
-#![allow(clippy::iter_kv_map, clippy::enum_variant_names)]
+#![allow(clippy::iter_kv_map, clippy::enum_variant_names, async_fn_in_trait)]
 
-mod clients;
-mod config;
-mod models;
-mod orchestrator;
-mod pb;
+pub mod args;
+pub mod clients;
+pub mod config;
+pub mod health;
+pub mod models;
+pub mod orchestrator;
+pub mod pb;
 pub mod server;
+pub mod utils;
+#[allow(unused_imports)]
+pub(crate) use utils::AsUriExt;

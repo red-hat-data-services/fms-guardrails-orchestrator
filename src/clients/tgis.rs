@@ -15,88 +15,130 @@
 
 */
 
-use std::{collections::HashMap, pin::Pin};
-
-use futures::{Stream, StreamExt};
+use async_trait::async_trait;
+use axum::http::HeaderMap;
+use futures::{StreamExt, TryStreamExt};
 use ginepro::LoadBalancedChannel;
+use tonic::Code;
+use tracing::{debug, instrument, Span};
 
-use super::{create_grpc_clients, Error};
+use super::{
+    create_grpc_client, errors::grpc_to_http_code, grpc_request_with_headers,
+    otel_grpc::OtelGrpcService, BoxStream, Client, Error,
+};
 use crate::{
-    clients::COMMON_ROUTER_KEY,
     config::ServiceConfig,
+    health::{HealthCheckResult, HealthStatus},
     pb::fmaas::{
         generation_service_client::GenerationServiceClient, BatchedGenerationRequest,
         BatchedGenerationResponse, BatchedTokenizeRequest, BatchedTokenizeResponse,
         GenerationResponse, ModelInfoRequest, ModelInfoResponse, SingleGenerationRequest,
     },
+    utils::trace::trace_context_from_grpc_response,
 };
+
+const DEFAULT_PORT: u16 = 8033;
 
 #[cfg_attr(test, faux::create)]
 #[derive(Clone)]
 pub struct TgisClient {
-    clients: HashMap<String, GenerationServiceClient<LoadBalancedChannel>>,
+    client: GenerationServiceClient<OtelGrpcService<LoadBalancedChannel>>,
 }
 
 #[cfg_attr(test, faux::methods)]
 impl TgisClient {
-    pub async fn new(default_port: u16, config: &[(String, ServiceConfig)]) -> Self {
-        let clients = create_grpc_clients(default_port, config, GenerationServiceClient::new).await;
-        Self { clients }
+    pub async fn new(config: &ServiceConfig) -> Self {
+        let client = create_grpc_client(DEFAULT_PORT, config, GenerationServiceClient::new).await;
+        Self { client }
     }
 
-    fn client(
-        &self,
-        _model_id: &str,
-    ) -> Result<GenerationServiceClient<LoadBalancedChannel>, Error> {
-        // NOTE: We currently forward requests to the common-router, so we use a single client.
-        let model_id = COMMON_ROUTER_KEY;
-        Ok(self
-            .clients
-            .get(model_id)
-            .ok_or_else(|| Error::ModelNotFound {
-                model_id: model_id.to_string(),
-            })?
-            .clone())
-    }
-
+    #[instrument(skip_all, fields(model_id = request.model_id))]
     pub async fn generate(
         &self,
         request: BatchedGenerationRequest,
+        headers: HeaderMap,
     ) -> Result<BatchedGenerationResponse, Error> {
-        let model_id = request.model_id.as_str();
-        Ok(self.client(model_id)?.generate(request).await?.into_inner())
+        let request = grpc_request_with_headers(request, headers);
+        debug!(?request, "sending request to TGIS gRPC service");
+        let mut client = self.client.clone();
+        let response = client.generate(request).await?;
+        let span = Span::current();
+        trace_context_from_grpc_response(&span, &response);
+        Ok(response.into_inner())
     }
 
+    #[instrument(skip_all, fields(model_id = request.model_id))]
     pub async fn generate_stream(
         &self,
         request: SingleGenerationRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = GenerationResponse> + Send>>, Error> {
-        let model_id = request.model_id.as_str();
-        let response_stream = self
-            .client(model_id)?
-            .generate_stream(request)
-            .await?
-            .into_inner()
-            .map(|resp| resp.unwrap())
-            .boxed();
-        Ok(response_stream)
+        headers: HeaderMap,
+    ) -> Result<BoxStream<Result<GenerationResponse, Error>>, Error> {
+        let request = grpc_request_with_headers(request, headers);
+        debug!(?request, "sending request to TGIS gRPC service");
+        let mut client = self.client.clone();
+        let response = client.generate_stream(request).await?;
+        let span = Span::current();
+        trace_context_from_grpc_response(&span, &response);
+        Ok(response.into_inner().map_err(Into::into).boxed())
     }
 
+    #[instrument(skip_all, fields(model_id = request.model_id))]
     pub async fn tokenize(
         &self,
         request: BatchedTokenizeRequest,
+        headers: HeaderMap,
     ) -> Result<BatchedTokenizeResponse, Error> {
-        let model_id = request.model_id.as_str();
-        Ok(self.client(model_id)?.tokenize(request).await?.into_inner())
+        let mut client = self.client.clone();
+        let request = grpc_request_with_headers(request, headers);
+        debug!(?request, "sending request to TGIS gRPC service");
+        let response = client.tokenize(request).await?;
+        let span = Span::current();
+        trace_context_from_grpc_response(&span, &response);
+        Ok(response.into_inner())
     }
 
     pub async fn model_info(&self, request: ModelInfoRequest) -> Result<ModelInfoResponse, Error> {
-        let model_id = request.model_id.as_str();
-        Ok(self
-            .client(model_id)?
-            .model_info(request)
-            .await?
-            .into_inner())
+        debug!(?request, "sending request to TGIS gRPC service");
+        let request = grpc_request_with_headers(request, HeaderMap::new());
+        let mut client = self.client.clone();
+        let response = client.model_info(request).await?;
+        let span = Span::current();
+        trace_context_from_grpc_response(&span, &response);
+        Ok(response.into_inner())
+    }
+}
+
+#[cfg_attr(test, faux::methods)]
+#[async_trait]
+impl Client for TgisClient {
+    fn name(&self) -> &str {
+        "tgis"
+    }
+
+    async fn health(&self) -> HealthCheckResult {
+        let mut client = self.client.clone();
+        let response = client
+            .model_info(ModelInfoRequest {
+                model_id: "".into(),
+            })
+            .await;
+        let code = match response {
+            Ok(_) => Code::Ok,
+            Err(status) if matches!(status.code(), Code::InvalidArgument | Code::NotFound) => {
+                Code::Ok
+            }
+            Err(status) => status.code(),
+        };
+        let status = if matches!(code, Code::Ok) {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Unhealthy
+        };
+        HealthCheckResult {
+            status,
+            code: grpc_to_http_code(code),
+            reason: None,
+        }
     }
 }
 
