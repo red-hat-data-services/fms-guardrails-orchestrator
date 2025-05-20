@@ -15,7 +15,7 @@
 
 */
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, btree_map},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,12 +26,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
-use super::{
-    ChatCompletionsDetectionTask, Context, Error, Orchestrator, UNSUITABLE_OUTPUT_MESSAGE,
-};
+use super::{ChatCompletionsDetectionTask, Context, Error, Orchestrator};
 use crate::{
     clients::{
-        detector::{ChatDetectionRequest, ContentAnalysisRequest},
+        detector::{ChatDetectionRequest, ContentAnalysisRequest, ContentAnalysisResponse},
         openai::{
             ChatCompletion, ChatCompletionChoice, ChatCompletionsRequest, ChatCompletionsResponse,
             ChatDetections, Content, DetectionResult, InputDetectionResult, OpenAiClient,
@@ -39,11 +37,13 @@ use crate::{
         },
     },
     config::DetectorType,
-    models::{DetectionWarningReason, DetectorParams, GuardrailDetection},
+    models::{
+        DetectionWarningReason, DetectorParams, UNSUITABLE_INPUT_MESSAGE, UNSUITABLE_OUTPUT_MESSAGE,
+    },
     orchestrator::{
+        Chunk,
         detector_processing::content,
         unary::{chunk, detect_content},
-        Chunk, UNSUITABLE_INPUT_MESSAGE,
     },
 };
 
@@ -52,7 +52,7 @@ use crate::{
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessageInternal {
     /// Index of the message
-    pub message_index: usize,
+    pub message_index: u32,
     /// The role of the messages author.
     pub role: Role,
     /// The contents of the message.
@@ -76,7 +76,7 @@ impl From<&ChatCompletionsRequest> for Vec<ChatMessageInternal> {
             .iter()
             .enumerate()
             .map(|(index, message)| ChatMessageInternal {
-                message_index: index,
+                message_index: index as u32,
                 role: message.role.clone(),
                 content: message.content.clone(),
                 refusal: message.refusal.clone(),
@@ -181,7 +181,7 @@ impl Orchestrator {
                 let chat_completions = client
                     .chat_completions(chat_request, headers)
                     .await
-                    .map_err(|error| Error::ChatGenerateRequestFailed {
+                    .map_err(|error| Error::ChatCompletionRequestFailed {
                         id: model_id.clone(),
                         error,
                     })?;
@@ -259,7 +259,7 @@ pub async fn message_detection(
                     // spawn parallel processes for each message index and run detection on them.
                     messages
                         .into_iter()
-                        .map(|(idx, chunks)| {
+                        .map(|(index, chunks)| {
                             let ctx = ctx.clone();
                             let detector_id = detector_id.clone();
                             let detector_params = detector_params.clone();
@@ -269,7 +269,7 @@ pub async fn message_detection(
                                 async move {
                                     // Call content detector on the chunks of particular message
                                     // and return the index and detection results
-                                    let result = detect_content(
+                                    let detections = detect_content(
                                         ctx.clone(),
                                         detector_id.clone(),
                                         default_threshold,
@@ -277,31 +277,8 @@ pub async fn message_detection(
                                         chunks,
                                         headers.clone(),
                                     )
-                                    .await;
-                                    match result {
-                                        Ok(value) => {
-                                            if !value.is_empty() {
-                                                let detection_result = DetectionResult {
-                                                index: idx,
-                                                results: value
-                                                    .into_iter()
-                                                    .map(|result| {
-                                                        GuardrailDetection::ContentAnalysisResponse(
-                                                            result,
-                                                        )
-                                                    })
-                                                    .collect::<Vec<_>>(),
-                                            };
-                                                Ok(detection_result)
-                                            } else {
-                                                Ok(DetectionResult {
-                                                    index: idx,
-                                                    results: vec![],
-                                                })
-                                            }
-                                        }
-                                        Err(error) => Err(error),
-                                    }
+                                    .await?;
+                                    Ok((index, detections))
                                 }
                             })
                         })
@@ -312,13 +289,33 @@ pub async fn message_detection(
         })
         .collect::<Vec<_>>();
 
+    // Await detections
     let detections = try_join_all(tasks)
         .await?
         .into_iter()
-        .collect::<Result<Vec<_>, Error>>()?
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    // Build detection map
+    let mut detection_map: BTreeMap<u32, Vec<ContentAnalysisResponse>> = BTreeMap::new();
+    for (index, detections) in detections {
+        if !detections.is_empty() {
+            match detection_map.entry(index) {
+                btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().extend_from_slice(&detections);
+                }
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(detections);
+                }
+            }
+        }
+    }
+
+    // Build vec of DetectionResult
+    // NOTE: seems unnecessary, could we just use the BTreeMap instead?
+    let detections = detection_map
         .into_iter()
-        .filter(|detection| !detection.results.is_empty())
-        .collect::<Vec<DetectionResult>>();
+        .map(|(index, results)| DetectionResult { index, results })
+        .collect::<Vec<_>>();
 
     Ok((!detections.is_empty()).then_some(detections))
 }
@@ -358,7 +355,7 @@ fn preprocess_chat_messages(
 async fn detector_chunk_task(
     ctx: &Arc<Context>,
     detector_chat_messages: HashMap<String, Vec<ChatMessageInternal>>,
-) -> Result<HashMap<String, Vec<(usize, Vec<Chunk>)>>, Error> {
+) -> Result<HashMap<String, Vec<(u32, Vec<Chunk>)>>, Error> {
     let mut chunks = HashMap::new();
 
     // TODO: Improve error handling for the code below
@@ -420,12 +417,8 @@ fn sort_detections(mut detections: Vec<DetectionResult>) -> Vec<DetectionResult>
     detections
         .into_iter()
         .map(|mut detection| {
-            let last_idx = detection.results.len();
-            // sort detection by starting span, if span is not present then move to the end of the message
-            detection.results.sort_by_key(|r| match r {
-                GuardrailDetection::ContentAnalysisResponse(value) => value.start,
-                _ => last_idx,
-            });
+            // sort detection by starting span
+            detection.results.sort_by_key(|value| value.start);
             detection
         })
         .collect::<Vec<_>>()
@@ -438,7 +431,7 @@ async fn handle_output_detections(
     headers: &HeaderMap,
     model_id: String,
 ) -> Option<ChatCompletionsResponse> {
-    if let ChatCompletionsResponse::Unary(ref chat_completion) = chat_completions {
+    if let ChatCompletionsResponse::Unary(chat_completion) = chat_completions {
         let choices = Vec::<ChatMessageInternal>::from(chat_completion);
 
         let output_detections = match detector_output {
@@ -633,9 +626,11 @@ mod tests {
         let result: Result<ChatCompletionsRequest, _> = serde_json::from_str(json_data);
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
-        assert!(error
-            .to_string()
-            .contains("unknown field `additional_field"));
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `additional_field")
+        );
 
         // Additional unknown field (additional_message")
         let json_data = r#"

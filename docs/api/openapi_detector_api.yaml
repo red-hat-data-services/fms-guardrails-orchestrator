@@ -52,12 +52,16 @@ paths:
                     text: foo@bar.com
                     detection: EmailAddress
                     score: 0.99
+                    evidence: {}
+                    metadata: {}
                   - start: 105
                     end: 116
                     text: 123-456-7890
                     detection_type: pii
                     detection: SocialSecurity
                     score: 0.99
+                    evidence: {}
+                    metadata: {}
         '404':
           description: Resource Not Found
           content:
@@ -108,6 +112,8 @@ paths:
                   - detection: relevant
                     detection_type: dummy_detector_type
                     score: 0.89
+                    evidence: {}
+                    metadata: {}
         '404':
           description: Resource Not Found
           content:
@@ -157,6 +163,8 @@ paths:
                   - detection: "detection_type"
                     detection_type: "dummy_detector_type"
                     score: 0.99
+                    evidence: {}
+                    metadata: {}
         '404':
           description: Resource Not Found
           content:
@@ -211,6 +219,7 @@ paths:
                       - name: "context_chunk"
                         value: "Context sentence 1"
                         score: 0.333
+                    metadata: {}
         '404':
           description: Resource Not Found
           content:
@@ -243,6 +252,15 @@ components:
             allOf:
               - $ref: https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml#/components/schemas/ChatCompletionRequestMessage
               - type: object
+        tools:
+          type: array
+          description: >
+            From OpenAI, A list of tools the model may call. Currently, only functions
+            are supported as a tool. Use this to provide a list of functions
+            the model may generate JSON inputs for. A max of 128 functions
+            are supported.
+          items:
+            $ref: https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml#/components/schemas/ChatCompletionTool
         detector_params:
           type: object
           default: {}
@@ -272,6 +290,11 @@ components:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
           description: Optional field providing evidence for the provided detection
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       type: object
       required:
         - detection
@@ -329,6 +352,11 @@ components:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
           description: Optional field providing evidence for the provided detection
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       type: object
       required:
         - detection
@@ -456,6 +484,11 @@ components:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
           description: Optional field providing evidence for the provided detection
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       type: object
       required:
         - detection
@@ -530,6 +563,11 @@ components:
                 $ref: '#/components/schemas/EvidenceObj'
               type: array
           description: Optional field providing evidence for the provided detection
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       type: object
       required:
         - start

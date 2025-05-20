@@ -22,32 +22,33 @@ use futures::{
     future::try_join_all,
     stream::{self, StreamExt},
 };
-use tracing::{debug, error, info, instrument, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, instrument};
 
 use super::{
-    apply_masks, get_chunker_ids, ChatDetectionTask, Chunk, ClassificationWithGenTask, Context,
-    ContextDocsDetectionTask, DetectionOnGenerationTask, Error, GenerationWithDetectionTask,
-    Orchestrator, TextContentDetectionTask,
+    ChatDetectionTask, Chunk, ClassificationWithGenTask, Context, ContextDocsDetectionTask,
+    DetectionOnGenerationTask, Error, GenerationWithDetectionTask, Orchestrator,
+    TextContentDetectionTask,
 };
 use crate::{
     clients::{
-        chunker::{tokenize_whole_doc, ChunkerClient, DEFAULT_CHUNKER_ID},
+        GenerationClient,
+        chunker::{ChunkerClient, DEFAULT_CHUNKER_ID, tokenize_whole_doc},
         detector::{
             ChatDetectionRequest, ContentAnalysisRequest, ContentAnalysisResponse,
             ContextDocsDetectionRequest, ContextType, GenerationDetectionRequest,
             TextChatDetectorClient, TextContentsDetectorClient, TextContextDocDetectorClient,
             TextGenerationDetectorClient,
         },
-        openai::Message,
-        GenerationClient,
+        openai::{Message, Tool},
     },
     models::{
         ChatDetectionResult, ClassifiedGeneratedTextResult, ContextDocsResult,
         DetectionOnGenerationResult, DetectionResult, DetectionWarning, DetectionWarningReason,
         DetectorParams, GenerationWithDetectionResult, GuardrailsTextGenerationParameters,
         TextContentDetectionResult, TextGenTokenClassificationResults, TokenClassificationResult,
+        UNSUITABLE_INPUT_MESSAGE,
     },
-    orchestrator::UNSUITABLE_INPUT_MESSAGE,
+    orchestrator::common::{apply_masks, get_chunker_ids},
     pb::caikit::runtime::chunkers,
 };
 
@@ -492,6 +493,7 @@ impl Orchestrator {
                             let detector_id = detector_id.clone();
                             let detector_params = detector_params.clone();
                             let messages = task.messages.clone();
+                            let tools = task.tools.clone();
                             let headers = headers.clone();
                             async {
                                 detect_for_chat(
@@ -499,6 +501,7 @@ impl Orchestrator {
                                     detector_id,
                                     detector_params,
                                     messages,
+                                    tools,
                                     headers,
                                 )
                                 .await
@@ -827,6 +830,7 @@ pub async fn detect_for_chat(
     detector_id: String,
     mut detector_params: DetectorParams,
     messages: Vec<Message>,
+    tools: Vec<Tool>,
     headers: HeaderMap,
 ) -> Result<Vec<DetectionResult>, Error> {
     let detector_id = detector_id.clone();
@@ -839,7 +843,7 @@ pub async fn detect_for_chat(
                 .default_threshold,
         ),
     );
-    let request = ChatDetectionRequest::new(messages.clone(), detector_params);
+    let request = ChatDetectionRequest::new(messages, tools, detector_params);
     debug!(%detector_id, ?request, "sending chat detector request");
     let client = ctx
         .clients
@@ -1041,12 +1045,11 @@ mod tests {
     use super::*;
     use crate::{
         clients::{
-            self,
+            self, ClientMap, GenerationClient, TgisClient,
             detector::{ContentAnalysisResponse, GenerationDetectionRequest},
-            ClientMap, GenerationClient, TgisClient,
         },
         config::{DetectorConfig, OrchestratorConfig},
-        models::{DetectionResult, EvidenceObj, FinishReason, THRESHOLD_PARAM},
+        models::{DetectionResult, EvidenceObj, FinishReason, Metadata, THRESHOLD_PARAM},
         pb::fmaas::{
             BatchedGenerationRequest, BatchedGenerationResponse, GenerationRequest,
             GenerationResponse, StopReason,
@@ -1173,6 +1176,7 @@ mod tests {
                 detector_id: Some(detector_id.to_string()),
                 score: 0.1,
                 evidence: Some(vec![]),
+                metadata: Metadata::new(),
             }],
             vec![ContentAnalysisResponse {
                 start: 0,
@@ -1183,6 +1187,7 @@ mod tests {
                 detector_id: Some(detector_id.to_string()),
                 score: 0.9,
                 evidence: Some(vec![]),
+                metadata: Metadata::new(),
             }],
         ]));
 
@@ -1332,6 +1337,7 @@ mod tests {
                 }]
                 .to_vec(),
             ),
+            metadata: Metadata::new(),
         }];
 
         faux::when!(detector_client.text_generation(
@@ -1358,6 +1364,7 @@ mod tests {
                 }]
                 .to_vec(),
             ),
+            metadata: Metadata::new(),
         }]));
 
         let mut clients = ClientMap::new();
@@ -1419,6 +1426,7 @@ mod tests {
             detector_id: Some(detector_id.to_string()),
             score: 0.1,
             evidence: None,
+            metadata: Metadata::new(),
         }]));
 
         let mut clients = ClientMap::new();

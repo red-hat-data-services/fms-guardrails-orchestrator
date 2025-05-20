@@ -21,26 +21,26 @@ use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use aggregator::Aggregator;
 use axum::http::HeaderMap;
-use futures::{future::try_join_all, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, future::try_join_all};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
-use tracing::{debug, error, info, instrument, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, instrument, warn};
 
-use super::{get_chunker_ids, Context, Error, Orchestrator, StreamingClassificationWithGenTask};
+use super::{Context, Error, Orchestrator, StreamingClassificationWithGenTask};
 use crate::{
     clients::{
-        chunker::{tokenize_whole_doc_stream, ChunkerClient, DEFAULT_CHUNKER_ID},
-        detector::ContentAnalysisRequest,
         GenerationClient, TextContentsDetectorClient,
+        chunker::{ChunkerClient, DEFAULT_CHUNKER_ID, tokenize_whole_doc_stream},
+        detector::ContentAnalysisRequest,
     },
     models::{
         ClassifiedGeneratedTextStreamResult, DetectionWarning, DetectionWarningReason,
         DetectorParams, GuardrailsTextGenerationParameters, TextGenTokenClassificationResults,
-        TokenClassificationResult,
+        TokenClassificationResult, UNSUITABLE_INPUT_MESSAGE,
     },
     orchestrator::{
+        common::get_chunker_ids,
         unary::{input_detection_task, tokenize},
-        UNSUITABLE_INPUT_MESSAGE,
     },
     pb::{caikit::runtime::chunkers, caikit_data_model::nlp::ChunkerTokenizationStreamResult},
 };
