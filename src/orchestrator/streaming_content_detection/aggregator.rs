@@ -34,13 +34,13 @@ use tracing::instrument;
 
 use crate::{
     clients::detector::ContentAnalysisResponse,
-    models::StreamingContentDetectionResponse,
+    models::{Metadata, StreamingContentDetectionResponse},
     orchestrator::{
-        streaming::{
-            aggregator::{AggregationStrategy, DetectorId, Tracker, TrackerEntry},
-            Chunk, Detections,
-        },
         Error,
+        streaming::{
+            Chunk, Detections,
+            aggregator::{AggregationStrategy, DetectorId, Tracker, TrackerEntry},
+        },
     },
 };
 
@@ -161,6 +161,7 @@ impl AggregationActor {
                             detector_id: r.detector_id,
                             score: r.score,
                             evidence: None,
+                            metadata: Metadata::new(),
                         })
                         .collect(),
                 };

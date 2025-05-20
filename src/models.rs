@@ -17,7 +17,7 @@
 
 #![allow(unused_qualifications)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,12 +47,14 @@ pub struct InfoParams {
 
 /// Parameters relevant to each detector
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct DetectorParams(HashMap<String, serde_json::Value>);
+pub struct DetectorParams(BTreeMap<String, serde_json::Value>);
+
+pub type Metadata = BTreeMap<String, serde_json::Value>;
 
 impl DetectorParams {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self(BTreeMap::new())
     }
 
     /// Threshold to filter detector results by score.
@@ -62,7 +64,7 @@ impl DetectorParams {
 }
 
 impl std::ops::Deref for DetectorParams {
-    type Target = HashMap<String, serde_json::Value>;
+    type Target = BTreeMap<String, serde_json::Value>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -496,7 +498,13 @@ pub enum FinishReason {
     Error,
 }
 
-/// Warning reason and message on input detection
+pub const UNSUITABLE_INPUT_MESSAGE: &str = "Unsuitable input detected. \
+    Please check the detected entities on your input and try again \
+    with the unsuitable input removed.";
+
+pub const UNSUITABLE_OUTPUT_MESSAGE: &str = "Unsuitable output detected.";
+
+/// Detection warning reason and message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetectionWarning {
     /// Warning reason
@@ -913,6 +921,10 @@ pub struct DetectionResult {
     // Optional evidence block
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<EvidenceObj>>,
+
+    // Optional metadata block
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -973,8 +985,12 @@ pub struct ChatDetectionHttpRequest {
     /// The map of detectors to be used, along with their respective parameters, e.g. thresholds.
     pub detectors: HashMap<String, DetectorParams>,
 
-    // The list of messages to run detections on.
+    /// The list of messages to run detections on.
     pub messages: Vec<clients::openai::Message>,
+
+    /// An optional list of tools definitions to analyze with messages
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<clients::openai::Tool>,
 }
 
 impl ChatDetectionHttpRequest {
@@ -1001,14 +1017,18 @@ impl ChatDetectionHttpRequest {
     }
 
     /// Validates if message contents are either a string or a content type of type "text"
+    /// content can be empty if tool_calls is provided
+    // ref. https://platform.openai.com/docs/api-reference/chat/create
     fn validate_messages(&self) -> Result<(), ValidationError> {
         for message in &self.messages {
             match &message.content {
                 Some(content) => self.validate_content_type(content)?,
                 None => {
-                    return Err(ValidationError::Invalid(
-                        "Message content cannot be empty".into(),
-                    ))
+                    if message.tool_calls.is_none() {
+                        return Err(ValidationError::Invalid(
+                            "Message content cannot be empty".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -1239,9 +1259,11 @@ mod tests {
         let result: Result<GuardrailsHttpRequest, _> = serde_json::from_str(json_data);
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
-        assert!(error
-            .to_string()
-            .contains("unknown field `guardrails_config`"));
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `guardrails_config`")
+        );
 
         // No inputs
         let request = GuardrailsHttpRequest {
@@ -1341,9 +1363,11 @@ mod tests {
             }),
             text_gen_parameters: None,
         };
-        assert!(request
-            .validate()
-            .is_err_and(|e| e.to_string().contains("must be a number")));
+        assert!(
+            request
+                .validate()
+                .is_err_and(|e| e.to_string().contains("must be a number"))
+        );
     }
 
     #[test]

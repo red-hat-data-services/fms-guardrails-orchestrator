@@ -446,6 +446,16 @@ components:
         score:
           type: number
           title: Score
+        evidence:
+          anyOf:
+            - items:
+                $ref: "#/components/schemas/EvidenceObj"
+              type: array
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       title: Content Detection Response Object
       example:
         start: 0
@@ -497,6 +507,15 @@ components:
             allOf:
               - $ref: https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml#/components/schemas/ChatCompletionRequestMessage
               - type: object
+        tools:
+          type: array
+          description: >
+            From OpenAI, A list of tools the model may call. Currently, only functions
+            are supported as a tool. Use this to provide a list of functions
+            the model may generate JSON inputs for. A max of 128 functions
+            are supported.
+          items:
+            $ref: https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml#/components/schemas/ChatCompletionTool
       additionalProperties: false
       required: ["detectors", "messages"]
       type: object
@@ -518,6 +537,16 @@ components:
               score:
                 type: number
                 title: Score
+              evidence:
+                anyOf:
+                  - items:
+                      $ref: "#/components/schemas/EvidenceObj"
+                    type: array
+              metadata:
+                type: object
+                default: {}
+                title: Metadata
+                description: Optional metadata for additional model information
           title: Detections on entire history of chat messages
       title: Chat Detection Response
       required: ["detections"]
@@ -575,6 +604,11 @@ components:
             - items:
                 $ref: "#/components/schemas/EvidenceObj"
               type: array
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       title: Context Docs Detection Response Object
 
     GenerationDetectionRequest:
@@ -617,6 +651,16 @@ components:
               score:
                 type: number
                 title: Score
+              evidence:
+                anyOf:
+                  - items:
+                      $ref: "#/components/schemas/EvidenceObj"
+                    type: array
+              metadata:
+                type: object
+                default: {}
+                title: Metadata
+                description: Optional metadata for additional model information
         input_token_count:
           type: string
           title: Input token Count
@@ -659,6 +703,16 @@ components:
         score:
           type: number
           title: Score
+        evidence:
+          anyOf:
+            - items:
+                $ref: "#/components/schemas/EvidenceObj"
+              type: array
+        metadata:
+          type: object
+          default: {}
+          title: Metadata
+          description: Optional metadata for additional model information
       title: Generated Text Detection Response Object
 
     ########################## Classification #################################

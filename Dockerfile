@@ -5,7 +5,7 @@ ARG CONFIG_FILE=config/config.yaml
 
 ## Rust builder ################################################################
 # Specific debian version so that compatible glibc version is used
-FROM rust:1.84.0-bullseye AS rust-builder
+FROM rust:1.85.1-bullseye AS rust-builder
 ARG PROTOC_VERSION
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
@@ -45,7 +45,7 @@ RUN cargo clippy --all-targets --all-features -- -D warnings
 
 ## Formatting check stage #######################################################
 FROM fms-guardrails-orchestr8-builder AS format
-RUN cargo fmt --check
+RUN cargo +nightly fmt --check
 
 ## Release Image ################################################################
 
@@ -64,6 +64,8 @@ RUN groupadd --system orchestr8 --gid 1001 && \
     --comment "FMS Orchestrator User" orchestr8
 
 USER orchestr8
+
+HEALTHCHECK NONE
 
 ENV ORCHESTRATOR_CONFIG=/app/config/config.yaml
 
