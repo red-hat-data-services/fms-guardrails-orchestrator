@@ -17,11 +17,14 @@
 use std::collections::HashMap;
 
 use common::{
-    detectors::{CONTEXT_DOC_DETECTOR_ENDPOINT, FACT_CHECKING_DETECTOR},
+    detectors::{
+        ANSWER_RELEVANCE_DETECTOR_SENTENCE, CONTEXT_DOC_DETECTOR_ENDPOINT, FACT_CHECKING_DETECTOR,
+        NON_EXISTING_DETECTOR,
+    },
     errors::{DetectorError, OrchestratorError},
     orchestrator::{
         ORCHESTRATOR_CONFIG_FILE_PATH, ORCHESTRATOR_CONTEXT_DOCS_DETECTION_ENDPOINT,
-        ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE, TestOrchestratorServer,
+        TestOrchestratorServer,
     },
 };
 use fms_guardrails_orchestr8::{
@@ -64,7 +67,7 @@ async fn no_detections() -> Result<(), anyhow::Error> {
                 context_type: ContextType::Url,
                 context: context.clone(),
             });
-        then.json(vec![detection.clone()]);
+        then.json([&detection]);
     });
 
     // Start orchestrator server and its dependencies
@@ -126,7 +129,7 @@ async fn detections() -> Result<(), anyhow::Error> {
                 context: context.clone(),
             });
 
-        then.json(vec![detection.clone()]);
+        then.json([&detection]);
     });
 
     // Start orchestrator server and its dependencies
@@ -214,8 +217,7 @@ async fn client_error() -> Result<(), anyhow::Error> {
     // assertions
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let response = response.json::<OrchestratorError>().await?;
-    assert_eq!(response.code, detector_error.code);
-    assert_eq!(response.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(response, OrchestratorError::internal());
 
     Ok(())
 }
@@ -361,6 +363,71 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
     debug!("{response:#?}");
     assert_eq!(response.code, 422);
     assert!(response.details.starts_with("missing field `detectors`"));
+
+    // Asserts requests missing `detectors` return 422.
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_CONTEXT_DOCS_DETECTION_ENDPOINT)
+        .json(&json!({
+            "content": content,
+            "context": context,
+            "context_type": "docs"
+        }))
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(response.code, 422);
+    assert!(response.details.starts_with("missing field `detectors`"));
+
+    // Asserts requests with detectors of invalid type return 422.
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_CONTEXT_DOCS_DETECTION_ENDPOINT)
+        .json(&ContextDocsHttpRequest {
+            detectors: HashMap::from([(
+                ANSWER_RELEVANCE_DETECTOR_SENTENCE.into(),
+                DetectorParams::new(),
+            )]),
+            content: content.into(),
+            context_type: ContextType::Url,
+            context: context.clone(),
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(
+        response,
+        OrchestratorError::detector_not_supported(ANSWER_RELEVANCE_DETECTOR_SENTENCE),
+        "failed on detector with invalid type scenario"
+    );
+
+    // Asserts requests with non-existing detectors return 404.
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_CONTEXT_DOCS_DETECTION_ENDPOINT)
+        .json(&ContextDocsHttpRequest {
+            detectors: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+            content: content.into(),
+            context_type: ContextType::Url,
+            context,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(
+        response,
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed on non-existing detector scenario"
+    );
 
     Ok(())
 }

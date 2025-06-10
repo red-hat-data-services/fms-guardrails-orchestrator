@@ -16,7 +16,7 @@
 */
 //! Client helpers
 use futures::{StreamExt, TryStreamExt};
-use http::HeaderMap;
+use http::{HeaderMap, header::CONTENT_TYPE};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::{debug, instrument};
@@ -30,7 +30,8 @@ use crate::{
             GenerationDetectionRequest, TextChatDetectorClient, TextContextDocDetectorClient,
             TextGenerationDetectorClient,
         },
-        openai::{self, ChatCompletionsResponse, OpenAiClient},
+        http::JSON_CONTENT_TYPE,
+        openai::{self, OpenAiClient},
     },
     models::{
         ClassifiedGeneratedTextResult as GenerateResponse, DetectorParams,
@@ -103,11 +104,12 @@ pub async fn detect_text_contents(
     detector_id: DetectorId,
     params: DetectorParams,
     chunks: Chunks,
+    apply_chunk_offset: bool,
 ) -> Result<Detections, Error> {
     let detector_id = detector_id.clone();
     let contents = chunks
-        .into_iter()
-        .map(|chunk| chunk.text)
+        .iter()
+        .map(|chunk| chunk.text.clone())
         .collect::<Vec<_>>();
     if contents.is_empty() {
         return Ok(Detections::default());
@@ -122,7 +124,26 @@ pub async fn detect_text_contents(
             error,
         })?;
     debug!(%detector_id, ?response, "received detector response");
-    Ok(response.into())
+    let detections = chunks
+        .into_iter()
+        .zip(response)
+        .flat_map(|(chunk, detections)| {
+            detections
+                .into_iter()
+                .map(|detection| {
+                    let mut detection: Detection = detection.into();
+                    detection.detector_id = Some(detector_id.clone());
+                    if apply_chunk_offset {
+                        let offset = chunk.start;
+                        detection.start = detection.start.map(|start| start + offset);
+                        detection.end = detection.end.map(|end| end + offset);
+                    }
+                    detection
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Detections>();
+    Ok(detections)
 }
 
 /// Sends request to text generation detector client.
@@ -146,7 +167,15 @@ pub async fn detect_text_generation(
             error,
         })?;
     debug!(%detector_id, ?response, "received detector response");
-    Ok(response.into())
+    let detections = response
+        .into_iter()
+        .map(|detection| {
+            let mut detection: Detection = detection.into();
+            detection.detector_id = Some(detector_id.clone());
+            detection
+        })
+        .collect::<Detections>();
+    Ok(detections)
 }
 
 /// Sends request to text chat detector client.
@@ -170,7 +199,15 @@ pub async fn detect_text_chat(
             error,
         })?;
     debug!(%detector_id, ?response, "received detector response");
-    Ok(response.into())
+    let detections = response
+        .into_iter()
+        .map(|detection| {
+            let mut detection: Detection = detection.into();
+            detection.detector_id = Some(detector_id.clone());
+            detection
+        })
+        .collect::<Detections>();
+    Ok(detections)
 }
 
 /// Sends request to text context detector client.
@@ -195,20 +232,27 @@ pub async fn detect_text_context(
             error,
         })?;
     debug!(%detector_id, ?response, "received detector response");
-    Ok(response.into())
+    let detections = response
+        .into_iter()
+        .map(|detection| {
+            let mut detection: Detection = detection.into();
+            detection.detector_id = Some(detector_id.clone());
+            detection
+        })
+        .collect::<Detections>();
+    Ok(detections)
 }
 
 /// Sends request to openai chat completions client.
 #[instrument(skip_all, fields(model_id))]
 pub async fn chat_completion(
     client: &OpenAiClient,
-    headers: HeaderMap,
-    mut request: openai::ChatCompletionsRequest,
+    mut headers: HeaderMap,
+    request: openai::ChatCompletionsRequest,
 ) -> Result<openai::ChatCompletionsResponse, Error> {
-    request.stream = false;
-    request.detectors = None;
     let model_id = request.model.clone();
     debug!(%model_id, ?request, "sending chat completions request");
+    headers.append(CONTENT_TYPE, JSON_CONTENT_TYPE);
     let response = client
         .chat_completions(request, headers)
         .await
@@ -224,13 +268,12 @@ pub async fn chat_completion(
 #[instrument(skip_all, fields(model_id))]
 pub async fn chat_completion_stream(
     client: &OpenAiClient,
-    headers: HeaderMap,
-    mut request: openai::ChatCompletionsRequest,
+    mut headers: HeaderMap,
+    request: openai::ChatCompletionsRequest,
 ) -> Result<ChatCompletionStream, Error> {
-    request.stream = true;
-    request.detectors = None;
     let model_id = request.model.clone();
     debug!(%model_id, ?request, "sending chat completions stream request");
+    headers.append(CONTENT_TYPE, JSON_CONTENT_TYPE);
     let response = client
         .chat_completions(request, headers)
         .await
@@ -239,8 +282,55 @@ pub async fn chat_completion_stream(
             error,
         })?;
     let stream = match response {
-        ChatCompletionsResponse::Streaming(rx) => ReceiverStream::new(rx),
-        ChatCompletionsResponse::Unary(_) => unimplemented!(),
+        openai::ChatCompletionsResponse::Streaming(rx) => ReceiverStream::new(rx),
+        openai::ChatCompletionsResponse::Unary(_) => unimplemented!(),
+    }
+    .enumerate()
+    .boxed();
+    Ok(stream)
+}
+
+/// Sends request to openai completions client.
+#[instrument(skip_all, fields(model_id))]
+pub async fn completion(
+    client: &OpenAiClient,
+    mut headers: HeaderMap,
+    request: openai::CompletionsRequest,
+) -> Result<openai::CompletionsResponse, Error> {
+    let model_id = request.model.clone();
+    debug!(%model_id, ?request, "sending completions request");
+    headers.append(CONTENT_TYPE, JSON_CONTENT_TYPE);
+    let response = client
+        .completions(request, headers)
+        .await
+        .map_err(|error| Error::CompletionRequestFailed {
+            id: model_id.clone(),
+            error,
+        })?;
+    debug!(%model_id, ?response, "received completions response");
+    Ok(response)
+}
+
+/// Sends stream request to openai completions client.
+#[instrument(skip_all, fields(model_id))]
+pub async fn completion_stream(
+    client: &OpenAiClient,
+    mut headers: HeaderMap,
+    request: openai::CompletionsRequest,
+) -> Result<CompletionStream, Error> {
+    let model_id = request.model.clone();
+    debug!(%model_id, ?request, "sending completions stream request");
+    headers.append(CONTENT_TYPE, JSON_CONTENT_TYPE);
+    let response = client
+        .completions(request, headers)
+        .await
+        .map_err(|error| Error::CompletionRequestFailed {
+            id: model_id.clone(),
+            error,
+        })?;
+    let stream = match response {
+        openai::CompletionsResponse::Streaming(rx) => ReceiverStream::new(rx),
+        openai::CompletionsResponse::Unary(_) => unimplemented!(),
     }
     .enumerate()
     .boxed();

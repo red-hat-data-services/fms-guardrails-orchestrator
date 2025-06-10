@@ -14,6 +14,7 @@
  limitations under the License.
 
 */
+pub mod chat_generation;
 pub mod chunker;
 pub mod detectors;
 pub mod errors;

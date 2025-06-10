@@ -21,7 +21,8 @@ use anyhow::Ok;
 use common::{
     chunker::CHUNKER_UNARY_ENDPOINT,
     detectors::{
-        DETECTOR_NAME_ANGLE_BRACKETS_SENTENCE, DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC,
+        ANSWER_RELEVANCE_DETECTOR_SENTENCE, DETECTOR_NAME_ANGLE_BRACKETS_SENTENCE,
+        DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC, NON_EXISTING_DETECTOR,
         TEXT_CONTENTS_DETECTOR_ENDPOINT,
     },
     errors::{DetectorError, OrchestratorError},
@@ -30,8 +31,8 @@ use common::{
         GENERATION_NLP_UNARY_ENDPOINT,
     },
     orchestrator::{
-        ORCHESTRATOR_CONFIG_FILE_PATH, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE,
-        ORCHESTRATOR_UNARY_ENDPOINT, ORCHESTRATOR_UNSUITABLE_INPUT_MESSAGE, TestOrchestratorServer,
+        ORCHESTRATOR_CONFIG_FILE_PATH, ORCHESTRATOR_UNARY_ENDPOINT,
+        ORCHESTRATOR_UNSUITABLE_INPUT_MESSAGE, TestOrchestratorServer,
     },
 };
 use fms_guardrails_orchestr8::{
@@ -55,12 +56,128 @@ use fms_guardrails_orchestr8::{
 use hyper::StatusCode;
 use mocktail::prelude::*;
 use test_log::test;
+use tracing::debug;
 
 pub mod common;
 
 // Constants
 const CHUNKER_NAME_SENTENCE: &str = "sentence_chunker";
 const MODEL_ID: &str = "my-super-model-8B";
+
+#[test(tokio::test)]
+async fn no_detectors() -> Result<(), anyhow::Error> {
+    // Add generation mock
+    let model_id = "my-super-model-8B";
+    let inputs = "Hi there! How are you?";
+
+    // Add expected generated text
+    let expected_response = GeneratedTextResult {
+        generated_text: "I am great!".into(),
+        generated_tokens: 0,
+        finish_reason: 0,
+        input_token_count: 0,
+        seed: 0,
+        tokens: vec![],
+        input_tokens: vec![],
+    };
+
+    let mut mocks = MockSet::new();
+    mocks.mock(|when, then| {
+        when.path(GENERATION_NLP_UNARY_ENDPOINT)
+            .header(GENERATION_NLP_MODEL_ID_HEADER_NAME, MODEL_ID)
+            .pb(TextGenerationTaskRequest {
+                text: inputs.into(),
+                ..Default::default()
+            });
+        then.pb(expected_response.clone());
+    });
+
+    // Configure mock servers
+    let generation_server = MockServer::new("nlp").grpc().with_mocks(mocks);
+
+    // Run test orchestrator server
+    let orchestrator_server = TestOrchestratorServer::builder()
+        .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
+        .generation_server(&generation_server)
+        .build()
+        .await?;
+
+    // Empty `guardrail_config` scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: inputs.into(),
+            guardrail_config: None,
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let results = response.json::<ClassifiedGeneratedTextResult>().await?;
+    assert_eq!(
+        results.generated_text,
+        Some(expected_response.clone().generated_text)
+    );
+    assert_eq!(results.warnings, None);
+
+    // `guardrail_config` with `input` and `output` set to None scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "Hi there! How are you?".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let results = response.json::<ClassifiedGeneratedTextResult>().await?;
+    assert_eq!(
+        results.generated_text,
+        Some(expected_response.clone().generated_text)
+    );
+    assert_eq!(results.warnings, None);
+
+    // `guardrail_config` with `input` and `output` set to empty map scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "Hi there! How are you?".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::new(),
+                    masks: None,
+                }),
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::new(),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let results = response.json::<ClassifiedGeneratedTextResult>().await?;
+    assert_eq!(
+        results.generated_text,
+        Some(expected_response.clone().generated_text)
+    );
+    assert_eq!(results.warnings, None);
+
+    Ok(())
+}
 
 // Validate that requests without detectors, input detector and output detector configured
 // returns text generated by model
@@ -103,7 +220,7 @@ async fn no_detections() -> Result<(), anyhow::Error> {
                 contents: vec![text_mock_input.clone()],
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![Vec::<ContentAnalysisResponse>::new()]);
+        then.json([Vec::<ContentAnalysisResponse>::new()]);
     });
 
     // Add output detector mock
@@ -115,7 +232,7 @@ async fn no_detections() -> Result<(), anyhow::Error> {
                 contents: vec![expected_response.generated_text.clone()],
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![Vec::<ContentAnalysisResponse>::new()]);
+        then.json([Vec::<ContentAnalysisResponse>::new()]);
     });
 
     // Add chunker tokenization for input mock
@@ -374,7 +491,7 @@ async fn input_detector_detections() -> Result<(), anyhow::Error> {
                 ],
                 detector_params: DetectorParams::new(),
             });
-        then.json([vec![], vec![expected_detections[0].clone()]]);
+        then.json([vec![], vec![&expected_detections[0]]]);
     });
 
     // Add input detection mock for multiple detections
@@ -391,8 +508,8 @@ async fn input_detector_detections() -> Result<(), anyhow::Error> {
             });
         then.json([
             vec![],
-            vec![expected_detections[0].clone()],
-            vec![expected_detections[1].clone()],
+            vec![&expected_detections[0]],
+            vec![&expected_detections[1]],
         ]);
     });
 
@@ -530,6 +647,8 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
         message: "Internal detector error.".into(),
     };
 
+    let orchestrator_error_500 = OrchestratorError::internal();
+
     // Add input for error scenarios
     let chunker_error_input = "This should return a 500 error on chunker";
     let detector_error_input = "This should return a 500 error on detector";
@@ -557,8 +676,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
                 contents: vec![detector_error_input.into()],
                 detector_params: DetectorParams::new(),
             });
-        then.internal_server_error()
-            .message(expected_detector_error.message);
+        then.internal_server_error().json(&expected_detector_error);
     });
     // Add generation mock for generation internal server error scenario
     generation_mocks.mock(|when, then| {
@@ -636,8 +754,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
 
     // Assertions for generation internal server error scenario
     let results = response.json::<OrchestratorError>().await?;
-    assert_eq!(results.code, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(results.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(results, orchestrator_error_500);
 
     // Orchestrator request with unary response for detector internal server error scenario
     let response = orchestrator_server
@@ -662,8 +779,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
 
     // Assertions for detector internal server error scenario
     let results = response.json::<OrchestratorError>().await?;
-    assert_eq!(results.code, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(results.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(results, orchestrator_error_500);
 
     // Orchestrator request with unary response
     let response = orchestrator_server
@@ -688,8 +804,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
 
     // Assertions for chunker internal server error scenario
     let results = response.json::<OrchestratorError>().await?;
-    assert_eq!(results.code, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(results.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(results, orchestrator_error_500);
 
     Ok(())
 }
@@ -858,7 +973,7 @@ async fn output_detector_detections() -> Result<(), anyhow::Error> {
                 ],
                 detector_params: DetectorParams::new(),
             });
-        then.json([vec![], vec![expected_detections[0].clone()]]);
+        then.json([vec![], vec![&expected_detections[0]]]);
     });
 
     // Add output detection mock for output multiple detections
@@ -875,8 +990,8 @@ async fn output_detector_detections() -> Result<(), anyhow::Error> {
             });
         then.json([
             vec![],
-            vec![expected_detections[0].clone()],
-            vec![expected_detections[1].clone()],
+            vec![&expected_detections[0]],
+            vec![&expected_detections[1]],
         ]);
     });
 
@@ -1007,6 +1122,8 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
         message: "Internal detector error.".into(),
     };
 
+    let orchestrator_error_500 = OrchestratorError::internal();
+
     // Add input for error scenarios
     let chunker_error_input = "This should return a 500 error on chunker";
     let detector_error_input = "This should return a 500 error on detector";
@@ -1024,7 +1141,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
                 contents: vec![generation_server_error_input.into()],
                 detector_params: DetectorParams::new(),
             });
-        then.json([vec![[Vec::<ContentAnalysisResponse>::new()]]]);
+        then.json([[[Vec::<ContentAnalysisResponse>::new()]]]);
     });
 
     // Add output detection mock for detector internal server error scenario
@@ -1035,8 +1152,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
                 contents: vec![detector_error_input.into()],
                 detector_params: DetectorParams::new(),
             });
-        then.internal_server_error()
-            .message(expected_detector_error.message);
+        then.internal_server_error().json(&expected_detector_error);
     });
 
     // Add generation mock for generation internal server error scenario
@@ -1141,8 +1257,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
 
     // Assertions for generation internal server error scenario
     let results = response.json::<OrchestratorError>().await?;
-    assert_eq!(results.code, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(results.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(results, orchestrator_error_500);
 
     // Orchestrator request with unary response for detector internal server error scenario
     let response = orchestrator_server
@@ -1166,8 +1281,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
 
     // Assertions for detector internal server error scenario
     let results = response.json::<OrchestratorError>().await?;
-    assert_eq!(results.code, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(results.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(results, orchestrator_error_500);
 
     // Orchestrator request with unary response
     let response = orchestrator_server
@@ -1191,8 +1305,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
 
     // Assertions for chunker internal server error scenario
     let results = response.json::<OrchestratorError>().await?;
-    assert_eq!(results.code, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(results.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(results, orchestrator_error_500);
 
     Ok(())
 }
@@ -1206,7 +1319,7 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .build()
         .await?;
 
-    // Orchestrator request with non existing field
+    // Extra request parameter scenario
     let response = orchestrator_server
         .post(ORCHESTRATOR_UNARY_ENDPOINT)
         .json(&serde_json::json!({
@@ -1219,13 +1332,121 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    // Assertions for invalid request
     let results = response.json::<OrchestratorError>().await?;
+    debug!("{results:#?}");
     assert_eq!(results.code, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(
         results
             .details
             .starts_with("non_existing_field: unknown field `non_existing_field`")
+    );
+
+    // Invalid input detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: MODEL_ID.into(),
+            inputs: "This should return a 422".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::from([(
+                        ANSWER_RELEVANCE_DETECTOR_SENTENCE.into(),
+                        DetectorParams::new(),
+                    )]),
+                    masks: None,
+                }),
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+
+    let results = response.json::<OrchestratorError>().await?;
+    debug!("{results:#?}");
+    assert_eq!(
+        results,
+        OrchestratorError::detector_not_supported(ANSWER_RELEVANCE_DETECTOR_SENTENCE),
+        "failed on input detector with invalid type scenario"
+    );
+
+    // non-existing input detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: MODEL_ID.into(),
+            inputs: "This should return a 404".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+                    masks: None,
+                }),
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+
+    let results = response.json::<OrchestratorError>().await?;
+    debug!("{results:#?}");
+    assert_eq!(
+        results,
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed on non-existing input detector scenario"
+    );
+
+    // Invalid output detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: MODEL_ID.into(),
+            inputs: "This should return a 422".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([(
+                        ANSWER_RELEVANCE_DETECTOR_SENTENCE.into(),
+                        DetectorParams::new(),
+                    )]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+
+    let results = response.json::<OrchestratorError>().await?;
+    debug!("{results:#?}");
+    assert_eq!(
+        results,
+        OrchestratorError::detector_not_supported(ANSWER_RELEVANCE_DETECTOR_SENTENCE),
+        "failed on output detector with invalid type scenario"
+    );
+
+    // non-existing output detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_UNARY_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: MODEL_ID.into(),
+            inputs: "This should return a 404".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+
+    let results = response.json::<OrchestratorError>().await?;
+    debug!("{results:#?}");
+    assert_eq!(
+        results,
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed on non-existing output detector scenario"
     );
 
     Ok(())

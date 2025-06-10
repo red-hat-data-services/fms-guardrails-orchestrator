@@ -23,7 +23,8 @@ use common::{
         CHUNKER_UNARY_ENDPOINT,
     },
     detectors::{
-        DETECTOR_NAME_ANGLE_BRACKETS_SENTENCE, DETECTOR_NAME_PARENTHESIS_SENTENCE,
+        DETECTOR_NAME_ANGLE_BRACKETS_SENTENCE, DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC,
+        DETECTOR_NAME_PARENTHESIS_SENTENCE, FACT_CHECKING_DETECTOR_SENTENCE, NON_EXISTING_DETECTOR,
         TEXT_CONTENTS_DETECTOR_ENDPOINT,
     },
     errors::{DetectorError, OrchestratorError},
@@ -32,9 +33,8 @@ use common::{
         GENERATION_NLP_TOKENIZATION_ENDPOINT,
     },
     orchestrator::{
-        ORCHESTRATOR_CONFIG_FILE_PATH, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE,
-        ORCHESTRATOR_STREAMING_ENDPOINT, ORCHESTRATOR_UNSUITABLE_INPUT_MESSAGE, SseStream,
-        TestOrchestratorServer,
+        ORCHESTRATOR_CONFIG_FILE_PATH, ORCHESTRATOR_STREAMING_ENDPOINT,
+        ORCHESTRATOR_UNSUITABLE_INPUT_MESSAGE, SseStream, TestOrchestratorServer,
     },
 };
 use eventsource_stream::Eventsource;
@@ -126,7 +126,7 @@ async fn no_detectors() -> Result<(), anyhow::Error> {
         .build()
         .await?;
 
-    // Example orchestrator request with streaming response
+    // Empty `guardrail_config` scenario
     let response = orchestrator_server
         .post(ORCHESTRATOR_STREAMING_ENDPOINT)
         .json(&GuardrailsHttpRequest {
@@ -138,13 +138,66 @@ async fn no_detectors() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    // Collects stream results
     let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
         SseStream::new(response.bytes_stream());
     let messages = sse_stream.try_collect::<Vec<_>>().await?;
     debug!("{messages:#?}");
 
-    // assertions
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].generated_text, Some("I".into()));
+    assert_eq!(messages[1].generated_text, Some(" am".into()));
+    assert_eq!(messages[2].generated_text, Some(" great!".into()));
+
+    // `guardrail_config` with `input` and `output` set to None scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "Hi there! How are you?".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+
+    let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
+        SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].generated_text, Some("I".into()));
+    assert_eq!(messages[1].generated_text, Some(" am".into()));
+    assert_eq!(messages[2].generated_text, Some(" great!".into()));
+
+    // `guardrail_config` with `input` and `output` set to empty map scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "Hi there! How are you?".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::new(),
+                    masks: None,
+                }),
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::new(),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+
+    let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
+        SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].generated_text, Some("I".into()));
     assert_eq!(messages[1].generated_text, Some(" am".into()));
@@ -333,7 +386,7 @@ async fn input_detector_detections() -> Result<(), anyhow::Error> {
                 ],
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![vec![], vec![mock_detection_response.clone()]]);
+        then.json([vec![], vec![&mock_detection_response]]);
     });
 
     // Add generation mock for input token count
@@ -351,6 +404,32 @@ async fn input_detector_detections() -> Result<(), anyhow::Error> {
         then.pb(mock_tokenization_response.clone());
     });
 
+    // Detector on whole doc / entire input for multi-detector scenario
+    let whole_doc_mock_detection_response = ContentAnalysisResponse {
+        start: 0,
+        end: 61,
+        text: "This sentence does not have a detection. But <this one does>.".into(),
+        detection: "has_angle_brackets_1".into(),
+        detection_type: "angle_brackets_1".into(),
+        detector_id: Some(DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC.into()),
+        score: 1.0,
+        evidence: None,
+        metadata: Metadata::new(),
+    };
+    let mut whole_doc_detection_mocks = MockSet::new();
+    whole_doc_detection_mocks.mock(|when, then| {
+        when.path(TEXT_CONTENTS_DETECTOR_ENDPOINT)
+            .json(ContentAnalysisRequest {
+                contents: vec![
+                    "This sentence does not have a detection. But <this one does>.".into(),
+                ],
+                detector_params: DetectorParams::new(),
+            });
+        then.json([vec![&whole_doc_mock_detection_response]]);
+    });
+    let mock_whole_doc_detector_server = MockServer::new(DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC)
+        .with_mocks(whole_doc_detection_mocks);
+
     // Start orchestrator server and its dependencies
     let mock_chunker_server = MockServer::new(chunker_id).grpc().with_mocks(chunker_mocks);
     let mock_detector_server = MockServer::new(detector_name).with_mocks(detection_mocks);
@@ -358,7 +437,7 @@ async fn input_detector_detections() -> Result<(), anyhow::Error> {
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .generation_server(&generation_server)
-        .detector_servers([&mock_detector_server])
+        .detector_servers([&mock_detector_server, &mock_whole_doc_detector_server])
         .chunker_servers([&mock_chunker_server])
         .build()
         .await?;
@@ -418,6 +497,65 @@ async fn input_detector_detections() -> Result<(), anyhow::Error> {
         }])
     );
 
+    // Multi-detector scenario with detector that uses content from entire input
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "This sentence does not have a detection. But <this one does>.".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::from([
+                        (detector_name.into(), DetectorParams::new()),
+                        (
+                            DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC.into(),
+                            DetectorParams::new(),
+                        ),
+                    ]),
+                    masks: None,
+                }),
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
+        SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].generated_text.is_none());
+    assert_eq!(
+        messages[0].token_classification_results,
+        TextGenTokenClassificationResults {
+            input: Some(vec![
+                TokenClassificationResult {
+                    start: 0,
+                    end: 61,
+                    word: whole_doc_mock_detection_response.text,
+                    entity: whole_doc_mock_detection_response.detection,
+                    entity_group: whole_doc_mock_detection_response.detection_type,
+                    detector_id: whole_doc_mock_detection_response.detector_id,
+                    score: whole_doc_mock_detection_response.score,
+                    token_count: None
+                },
+                TokenClassificationResult {
+                    start: 46, // index of first token of detected text, relative to the `inputs` string sent in the orchestrator request.
+                    end: 59, // index of last token (+1) of detected text, relative to the `inputs` string sent in the orchestrator request.
+                    word: "this one does".into(),
+                    entity: "has_angle_brackets".into(),
+                    entity_group: "angle_brackets".into(),
+                    detector_id: Some(detector_name.to_string()),
+                    score: mock_detection_response.score,
+                    token_count: None
+                }
+            ]),
+            output: None
+        }
+    );
+
     Ok(())
 }
 
@@ -431,6 +569,8 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
     let chunker_error_input = "Chunker should return an error";
     let detector_error_input = "Detector should return an error";
     let generation_server_error_input = "Generation should return an error";
+
+    let orchestrator_error_500 = OrchestratorError::internal();
 
     let mut chunker_mocks = MockSet::new();
     chunker_mocks.mock(|when, then| {
@@ -544,13 +684,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
     debug!("{messages:#?}");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0],
-        OrchestratorError {
-            code: 500,
-            details: ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE.into()
-        }
-    );
+    assert_eq!(messages[0], orchestrator_error_500);
 
     // Test error from detector
     let response = orchestrator_server
@@ -577,13 +711,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
     debug!("{messages:#?}");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0],
-        OrchestratorError {
-            code: 500,
-            details: ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE.into()
-        }
-    );
+    assert_eq!(messages[0], orchestrator_error_500);
 
     // Test error from generation server
     let response = orchestrator_server
@@ -610,13 +738,7 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
     debug!("{messages:#?}");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0],
-        OrchestratorError {
-            code: 500,
-            details: ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE.into()
-        }
-    );
+    assert_eq!(messages[0], orchestrator_error_500);
 
     Ok(())
 }
@@ -626,13 +748,12 @@ async fn input_detector_client_error() -> Result<(), anyhow::Error> {
 async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
     let model_id = "my-super-model-8B";
 
-    // Run test orchestrator server
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .build()
         .await?;
 
-    // Example orchestrator request with streaming response
+    // Request with extra fields scenario
     let response = orchestrator_server
         .post(ORCHESTRATOR_STREAMING_ENDPOINT)
         .json(&serde_json::json!({
@@ -649,15 +770,169 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
 
     debug!(?response);
 
-    // assertions
     assert_eq!(response.status(), 422);
-
     let response_body = response.json::<OrchestratorError>().await?;
     assert_eq!(response_body.code, 422);
     assert!(
         response_body
             .details
             .starts_with("non_existing_field: unknown field `non_existing_field`")
+    );
+
+    // Invalid input detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "This request contains a detector with invalid type".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::from([(
+                        FACT_CHECKING_DETECTOR_SENTENCE.into(),
+                        DetectorParams::new(),
+                    )]),
+                    masks: None,
+                }),
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!(?response);
+
+    assert_eq!(response.status(), 200);
+    let sse_stream: SseStream<OrchestratorError> = SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        OrchestratorError::detector_not_supported(FACT_CHECKING_DETECTOR_SENTENCE),
+        "failed at invalid input detector scenario"
+    );
+
+    // Non-existing input detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "This request contains a detector with invalid type".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: Some(GuardrailsConfigInput {
+                    models: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+                    masks: None,
+                }),
+                output: None,
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!(?response);
+
+    assert_eq!(response.status(), 200);
+    let sse_stream: SseStream<OrchestratorError> = SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed at non-existing input detector scenario"
+    );
+
+    // Invalid output detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "This request contains a detector with invalid type".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([(
+                        FACT_CHECKING_DETECTOR_SENTENCE.into(),
+                        DetectorParams::new(),
+                    )]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!(?response);
+
+    assert_eq!(response.status(), 200);
+    let sse_stream: SseStream<OrchestratorError> = SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        OrchestratorError::detector_not_supported(FACT_CHECKING_DETECTOR_SENTENCE),
+        "failed at invalid output detector scenario"
+    );
+
+    // Invalid chunker on output detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "This request contains a detector with an invalid chunker".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([(
+                        DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC.into(),
+                        DetectorParams::new(),
+                    )]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), 200);
+    let sse_stream: SseStream<OrchestratorError> = SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        OrchestratorError::chunker_not_supported(DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC),
+        "failed on output detector with invalid chunker scenario"
+    );
+
+    // Non-existing output detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "This request contains a detector with invalid type".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!(?response);
+
+    assert_eq!(response.status(), 200);
+    let sse_stream: SseStream<OrchestratorError> = SseStream::new(response.bytes_stream());
+    let messages = sse_stream.try_collect::<Vec<_>>().await?;
+    debug!("{messages:#?}");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed at non-existing output detector scenario"
     );
 
     Ok(())
@@ -771,9 +1046,8 @@ async fn output_detectors_no_detections() -> Result<(), anyhow::Error> {
         ]);
     });
 
-    // Add output detection mock
-    let mut angle_brackets_mocks = MockSet::new();
-    angle_brackets_mocks.mock(|when, then| {
+    let mut detection_mocks = MockSet::new();
+    detection_mocks.mock(|when, then| {
         when.post()
             .path(TEXT_CONTENTS_DETECTOR_ENDPOINT)
             .json(ContentAnalysisRequest {
@@ -782,27 +1056,7 @@ async fn output_detectors_no_detections() -> Result<(), anyhow::Error> {
             });
         then.json([Vec::<ContentAnalysisResponse>::new()]);
     });
-    angle_brackets_mocks.mock(|when, then| {
-        when.post()
-            .path(TEXT_CONTENTS_DETECTOR_ENDPOINT)
-            .json(ContentAnalysisRequest {
-                contents: vec![" What about you?".into()],
-                detector_params: DetectorParams::new(),
-            });
-        then.json([Vec::<ContentAnalysisResponse>::new()]);
-    });
-
-    let mut parenthesis_mocks = MockSet::new();
-    parenthesis_mocks.mock(|when, then| {
-        when.post()
-            .path(TEXT_CONTENTS_DETECTOR_ENDPOINT)
-            .json(ContentAnalysisRequest {
-                contents: vec!["I am great!".into()],
-                detector_params: DetectorParams::new(),
-            });
-        then.json([Vec::<ContentAnalysisResponse>::new()]);
-    });
-    parenthesis_mocks.mock(|when, then| {
+    detection_mocks.mock(|when, then| {
         when.post()
             .path(TEXT_CONTENTS_DETECTOR_ENDPOINT)
             .json(ContentAnalysisRequest {
@@ -815,9 +1069,9 @@ async fn output_detectors_no_detections() -> Result<(), anyhow::Error> {
     // Start orchestrator server and its dependencies
     let mock_chunker_server = MockServer::new(chunker_id).grpc().with_mocks(chunker_mocks);
     let mock_angle_brackets_detector_server =
-        MockServer::new(angle_brackets_detector).with_mocks(angle_brackets_mocks);
+        MockServer::new(angle_brackets_detector).with_mocks(detection_mocks.clone());
     let mock_parenthesis_detector_server =
-        MockServer::new(parenthesis_detector).with_mocks(parenthesis_mocks);
+        MockServer::new(parenthesis_detector).with_mocks(detection_mocks);
     let generation_server = MockServer::new("nlp").grpc().with_mocks(generation_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
@@ -831,7 +1085,7 @@ async fn output_detectors_no_detections() -> Result<(), anyhow::Error> {
         .build()
         .await?;
 
-    // Example orchestrator request with streaming response
+    // Single-detector scenario
     let response = orchestrator_server
         .post(ORCHESTRATOR_STREAMING_ENDPOINT)
         .json(&GuardrailsHttpRequest {
@@ -850,10 +1104,56 @@ async fn output_detectors_no_detections() -> Result<(), anyhow::Error> {
         })
         .send()
         .await?;
-
     debug!("{response:#?}");
 
-    // Test custom SseStream wrapper
+    let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
+        SseStream::new(response.bytes_stream());
+    let messages = sse_stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+    debug!("{messages:#?}");
+
+    assert_eq!(messages.len(), 2);
+
+    assert_eq!(messages[0].generated_text, Some("I am great!".into()));
+    assert_eq!(
+        messages[0].token_classification_results.output,
+        Some(vec![])
+    );
+    assert_eq!(messages[0].start_index, Some(0));
+    assert_eq!(messages[0].processed_index, Some(11));
+
+    assert_eq!(messages[1].generated_text, Some(" What about you?".into()));
+    assert_eq!(
+        messages[1].token_classification_results.output,
+        Some(vec![])
+    );
+    assert_eq!(messages[1].start_index, Some(11));
+    assert_eq!(messages[1].processed_index, Some(27));
+
+    // Multi-detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "Hi there! How are you?".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([
+                        (angle_brackets_detector.into(), DetectorParams::new()),
+                        (parenthesis_detector.into(), DetectorParams::new()),
+                    ]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
     let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
         SseStream::new(response.bytes_stream());
     let messages = sse_stream
@@ -1074,7 +1374,79 @@ async fn output_detectors_detections() -> Result<(), anyhow::Error> {
         .build()
         .await?;
 
-    // Example orchestrator request with streaming response
+    // Single-detector scenario
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_STREAMING_ENDPOINT)
+        .json(&GuardrailsHttpRequest {
+            model_id: model_id.into(),
+            inputs: "Hi there! How are you?".into(),
+            guardrail_config: Some(GuardrailsConfig {
+                input: None,
+                output: Some(GuardrailsConfigOutput {
+                    models: HashMap::from([(
+                        angle_brackets_detector.into(),
+                        DetectorParams::new(),
+                    )]),
+                }),
+            }),
+            text_gen_parameters: None,
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
+        SseStream::new(response.bytes_stream());
+    let messages = sse_stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+    debug!("{messages:#?}");
+
+    let expected_messages = vec![
+        ClassifiedGeneratedTextStreamResult {
+            generated_text: Some("I (am) great!".into()),
+            token_classification_results: TextGenTokenClassificationResults {
+                input: None,
+                output: Some(vec![]),
+            },
+            processed_index: Some(13),
+            start_index: Some(0),
+            tokens: Some(vec![]),
+            input_tokens: Some(vec![]),
+            ..Default::default()
+        },
+        ClassifiedGeneratedTextStreamResult {
+            generated_text: Some(" What about <you>?".into()),
+            token_classification_results: TextGenTokenClassificationResults {
+                input: None,
+                output: Some(vec![TokenClassificationResult {
+                    start: 13,
+                    end: 16,
+                    word: "you".into(),
+                    entity: "has_angle_brackets".into(),
+                    entity_group: "angle_brackets".into(),
+                    detector_id: Some(angle_brackets_detector.into()),
+                    score: 1.0,
+                    token_count: None,
+                }]),
+            },
+            processed_index: Some(31),
+            start_index: Some(13),
+            tokens: Some(vec![]),
+            input_tokens: Some(vec![]),
+            ..Default::default()
+        },
+    ];
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages, expected_messages,
+        "failed on single-detector scenario"
+    );
+
+    // Multi-detector scenario
     let response = orchestrator_server
         .post(ORCHESTRATOR_STREAMING_ENDPOINT)
         .json(&GuardrailsHttpRequest {
@@ -1093,10 +1465,8 @@ async fn output_detectors_detections() -> Result<(), anyhow::Error> {
         })
         .send()
         .await?;
-
     debug!("{response:#?}");
 
-    // Test custom SseStream wrapper
     let sse_stream: SseStream<ClassifiedGeneratedTextStreamResult> =
         SseStream::new(response.bytes_stream());
     let messages = sse_stream
@@ -1152,7 +1522,10 @@ async fn output_detectors_detections() -> Result<(), anyhow::Error> {
     ];
 
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages, expected_messages);
+    assert_eq!(
+        messages, expected_messages,
+        "failed on multi-detector scenario"
+    );
 
     Ok(())
 }
@@ -1161,6 +1534,8 @@ async fn output_detectors_detections() -> Result<(), anyhow::Error> {
 #[test(tokio::test)]
 async fn output_detector_client_error() -> Result<(), anyhow::Error> {
     let detector_name = DETECTOR_NAME_ANGLE_BRACKETS_SENTENCE;
+
+    let orchestrator_error_500 = OrchestratorError::internal();
 
     // Add generation mock
     let model_id = "my-super-model-8B";
@@ -1381,13 +1756,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
     debug!("{messages:#?}");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0],
-        OrchestratorError {
-            code: 500,
-            details: ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE.into()
-        }
-    );
+    assert_eq!(messages[0], orchestrator_error_500);
 
     // assert detector error
     let response = orchestrator_server
@@ -1439,13 +1808,7 @@ async fn output_detector_client_error() -> Result<(), anyhow::Error> {
     assert_eq!(first_response.start_index, Some(0));
     assert_eq!(first_response.processed_index, Some(11));
 
-    assert_eq!(
-        second_response,
-        OrchestratorError {
-            code: 500,
-            details: ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE.into()
-        }
-    );
+    assert_eq!(second_response, orchestrator_error_500);
 
     Ok(())
 }

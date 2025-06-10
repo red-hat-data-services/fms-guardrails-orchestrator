@@ -22,33 +22,34 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use hyper::{HeaderMap, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Map, Value};
 use tokio::sync::mpsc;
-use tracing::{info, instrument};
+use url::Url;
 
 use super::{
-    Client, Error, HttpClient, create_http_client, detector::ContentAnalysisResponse,
-    http::HttpClientExt,
+    Client, Error, HttpClient, create_http_client,
+    detector::ContentAnalysisResponse,
+    http::{HttpClientExt, RequestBody},
 };
 use crate::{
     config::ServiceConfig,
     health::HealthCheckResult,
-    models::{DetectionWarningReason, DetectorParams},
+    models::{DetectionWarningReason, DetectorParams, ValidationError},
     orchestrator,
 };
 
 const DEFAULT_PORT: u16 = 8080;
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "/v1/chat/completions";
+const COMPLETIONS_ENDPOINT: &str = "/v1/completions";
 
-#[cfg_attr(test, faux::create)]
 #[derive(Clone)]
 pub struct OpenAiClient {
     client: HttpClient,
     health_client: Option<HttpClient>,
 }
 
-#[cfg_attr(test, faux::methods)]
 impl OpenAiClient {
     pub async fn new(
         config: &ServiceConfig,
@@ -70,76 +71,110 @@ impl OpenAiClient {
         &self.client
     }
 
-    #[instrument(skip_all, fields(request.model))]
     pub async fn chat_completions(
         &self,
         request: ChatCompletionsRequest,
         headers: HeaderMap,
     ) -> Result<ChatCompletionsResponse, Error> {
-        let url = self.inner().endpoint(CHAT_COMPLETIONS_ENDPOINT);
-        info!("sending Open AI chat completion request to {}", url);
-        if request.stream {
-            let (tx, rx) = mpsc::channel(32);
-            let mut event_stream = self
-                .inner()
-                .post(url, headers, request)
-                .await?
-                .0
-                .into_data_stream()
-                .eventsource();
-            // Spawn task to forward events to receiver
-            tokio::spawn(async move {
-                while let Some(result) = event_stream.next().await {
-                    match result {
-                        Ok(event) if event.data == "[DONE]" => {
-                            // Send None to signal that the stream completed
-                            let _ = tx.send(Ok(None)).await;
-                            break;
-                        }
-                        Ok(event) => match serde_json::from_str::<ChatCompletionChunk>(&event.data)
-                        {
-                            Ok(chunk) => {
-                                let _ = tx.send(Ok(Some(chunk))).await;
-                            }
-                            Err(e) => {
-                                let error = Error::Http {
-                                    code: StatusCode::INTERNAL_SERVER_ERROR,
-                                    message: format!("deserialization error: {e}"),
-                                };
-                                let _ = tx.send(Err(error.into())).await;
-                            }
-                        },
-                        Err(error) => {
-                            // We received an error from the event stream, send error message
-                            let error = Error::Http {
-                                code: StatusCode::INTERNAL_SERVER_ERROR,
-                                message: error.to_string(),
-                            };
-                            let _ = tx.send(Err(error.into())).await;
-                        }
-                    }
-                }
-            });
+        let url = self.client.endpoint(CHAT_COMPLETIONS_ENDPOINT);
+        if let Some(true) = request.stream {
+            let rx = self.handle_streaming(url, request, headers).await?;
             Ok(ChatCompletionsResponse::Streaming(rx))
         } else {
-            let response = self.client.clone().post(url, headers, request).await?;
-            match response.status() {
-                StatusCode::OK => Ok(response.json::<ChatCompletion>().await?.into()),
-                _ => {
-                    let code = response.status();
-                    let message = if let Ok(response) = response.json::<OpenAiError>().await {
-                        response.message
-                    } else {
-                        "unknown error occurred".into()
-                    };
-                    Err(Error::Http { code, message })
-                }
+            let chat_completion = self.handle_unary(url, request, headers).await?;
+            Ok(ChatCompletionsResponse::Unary(chat_completion))
+        }
+    }
+
+    pub async fn completions(
+        &self,
+        request: CompletionsRequest,
+        headers: HeaderMap,
+    ) -> Result<CompletionsResponse, Error> {
+        let url = self.client.endpoint(COMPLETIONS_ENDPOINT);
+        if let Some(true) = request.stream {
+            let rx = self.handle_streaming(url, request, headers).await?;
+            Ok(CompletionsResponse::Streaming(rx))
+        } else {
+            let completion = self.handle_unary(url, request, headers).await?;
+            Ok(CompletionsResponse::Unary(completion))
+        }
+    }
+
+    async fn handle_unary<R, S>(&self, url: Url, request: R, headers: HeaderMap) -> Result<S, Error>
+    where
+        R: RequestBody,
+        S: DeserializeOwned,
+    {
+        let response = self.client.post(url, headers, request).await?;
+        match response.status() {
+            StatusCode::OK => response.json::<S>().await,
+            _ => {
+                let code = response.status();
+                let message = if let Ok(response) = response.json::<OpenAiError>().await {
+                    response.message
+                } else {
+                    "unknown error occurred".into()
+                };
+                Err(Error::Http { code, message })
             }
         }
     }
+
+    async fn handle_streaming<R, S>(
+        &self,
+        url: Url,
+        request: R,
+        headers: HeaderMap,
+    ) -> Result<mpsc::Receiver<Result<Option<S>, orchestrator::Error>>, Error>
+    where
+        R: RequestBody,
+        S: DeserializeOwned + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel(32);
+        let mut event_stream = self
+            .client
+            .post(url, headers, request)
+            .await?
+            .0
+            .into_data_stream()
+            .eventsource();
+        // Spawn task to forward events to receiver
+        tokio::spawn(async move {
+            while let Some(result) = event_stream.next().await {
+                match result {
+                    Ok(event) if event.data == "[DONE]" => {
+                        // Send None to signal that the stream completed
+                        let _ = tx.send(Ok(None)).await;
+                        break;
+                    }
+                    Ok(event) => match serde_json::from_str::<S>(&event.data) {
+                        Ok(chunk) => {
+                            let _ = tx.send(Ok(Some(chunk))).await;
+                        }
+                        Err(e) => {
+                            let error = Error::Http {
+                                code: StatusCode::INTERNAL_SERVER_ERROR,
+                                message: format!("deserialization error: {e}"),
+                            };
+                            let _ = tx.send(Err(error.into())).await;
+                        }
+                    },
+                    Err(error) => {
+                        // We received an error from the event stream, send error message
+                        let error = Error::Http {
+                            code: StatusCode::INTERNAL_SERVER_ERROR,
+                            message: error.to_string(),
+                        };
+                        let _ = tx.send(Err(error.into())).await;
+                    }
+                }
+            }
+        });
+        Ok(rx)
+    }
 }
 
-#[cfg_attr(test, faux::methods)]
 #[async_trait]
 impl Client for OpenAiClient {
     fn name(&self) -> &str {
@@ -155,13 +190,13 @@ impl Client for OpenAiClient {
     }
 }
 
-#[cfg_attr(test, faux::methods)]
 impl HttpClientExt for OpenAiClient {
     fn inner(&self) -> &HttpClient {
         self.client()
     }
 }
 
+/// Chat completions response.
 #[derive(Debug)]
 pub enum ChatCompletionsResponse {
     Unary(Box<ChatCompletion>),
@@ -174,135 +209,129 @@ impl From<ChatCompletion> for ChatCompletionsResponse {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChatCompletionsRequest {
-    /// A list of messages comprising the conversation so far.
-    pub messages: Vec<Message>,
-    /// ID of the model to use.
-    pub model: String,
-    /// Whether or not to store the output of this chat completion request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store: Option<bool>,
-    /// Developer-defined tags and values.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_penalty: Option<f32>,
-    /// Modify the likelihood of specified tokens appearing in the completion.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logit_bias: Option<HashMap<String, f32>>,
-    /// Whether to return log probabilities of the output tokens or not.
-    /// If true, returns the log probabilities of each output token returned in the content of message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<bool>,
-    /// An integer between 0 and 20 specifying the number of most likely tokens to return
-    /// at each token position, each with an associated log probability.
-    /// logprobs must be set to true if this parameter is used.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_logprobs: Option<u32>,
-    /// The maximum number of tokens that can be generated in the chat completion. (DEPRECATED)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    /// An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
-    /// How many chat completion choices to generate for each input message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
-    /// Positive values penalize new tokens based on whether they appear in the text so far,
-    /// increasing the model's likelihood to talk about new topics.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_penalty: Option<f32>,
-    /// An object specifying the format that the model must output.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<ResponseFormat>,
-    /// If specified, our system will make a best effort to sample deterministically,
-    /// such that repeated requests with the same seed and parameters should return the same result.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
-    /// Specifies the latency tier to use for processing the request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
-    /// Up to 4 sequences where the API will stop generating further tokens.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<StopTokens>,
-    /// If set, partial message deltas will be sent, like in ChatGPT.
-    /// Tokens will be sent as data-only server-sent events as they become available,
-    /// with the stream terminated by a data: [DONE] message.
-    #[serde(default)]
-    pub stream: bool,
-    /// Options for streaming response. Only set this when you set stream: true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_options: Option<StreamOptions>,
-    /// What sampling temperature to use, between 0 and 2.
-    /// Higher values like 0.8 will make the output more random,
-    /// while lower values like 0.2 will make it more focused and deterministic.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// An alternative to sampling with temperature, called nucleus sampling,
-    /// where the model considers the results of the tokens with top_p probability mass.
-    /// So 0.1 means only the tokens comprising the top 10% probability mass are considered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    /// A list of tools the model may call.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Tool>,
-    /// Controls which (if any) tool is called by the model.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ToolChoice>,
-    /// Whether to enable parallel function calling during tool use.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
-    /// A unique identifier representing your end-user.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-
-    // Additional vllm params
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub best_of: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub use_beam_search: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<isize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repetition_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub length_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub early_stopping: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ignore_eos: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<usize>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_special_tokens: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spaces_between_special_tokens: Option<bool>,
-
-    // Detectors
-    // Note: We are making it optional, since this structure also gets used to
-    // form request for chat completions. And downstream server, might choose to
-    // reject extra parameters.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detectors: Option<DetectorConfig>,
+/// Completions (legacy) response.
+#[derive(Debug)]
+pub enum CompletionsResponse {
+    Unary(Box<Completion>),
+    Streaming(mpsc::Receiver<Result<Option<Completion>, orchestrator::Error>>),
 }
 
-/// Structure to contain parameters for detectors.
+impl From<Completion> for CompletionsResponse {
+    fn from(value: Completion) -> Self {
+        Self::Unary(Box::new(value))
+    }
+}
+
+/// Chat completions request.
+///
+/// As orchestrator is only concerned with a limited subset
+/// of request fields, we only inline and validate fields used by
+/// this service. Extra fields are deserialized to `extra` via
+/// struct flattening. The `detectors` field is not serialized.
+///
+/// This is to avoid tracking and updating OpenAI and vLLM
+/// parameter additions/changes. Full validation is delegated to
+/// the downstream server implementation.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatCompletionsRequest {
+    /// Detector config.
+    #[serde(default, skip_serializing)]
+    pub detectors: DetectorConfig,
+    /// Stream parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Model name.
+    pub model: String,
+    /// Messages.
+    pub messages: Vec<Message>,
+    /// Extra fields not captured above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl ChatCompletionsRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.model.is_empty() {
+            return Err(ValidationError::Invalid("`model` must not be empty".into()));
+        }
+        if self.messages.is_empty() {
+            return Err(ValidationError::Invalid(
+                "`messages` must not be empty".into(),
+            ));
+        }
+
+        if !self.detectors.input.is_empty() {
+            // Content of type Array is not supported yet
+            // Adding this validation separately as we do plan to support arrays of string in the future
+            if let Some(Content::Array(_)) = self.messages.last().unwrap().content {
+                return Err(ValidationError::Invalid(
+                    "Detection on array is not supported".into(),
+                ));
+            }
+
+            // As text_content detections only run on last message at the moment, only the last
+            // message is being validated.
+            if self.messages.last().unwrap().is_text_content_empty() {
+                return Err(ValidationError::Invalid(
+                    "if input detectors are provided, `content` must not be empty on last message"
+                        .into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Completions (legacy) request.
+///
+/// As orchestrator is only concerned with a limited subset
+/// of request fields, we only inline and validate fields used by
+/// this service. Extra fields are deserialized to `extra` via
+/// struct flattening. The `detectors` field is not serialized.
+///
+/// This is to avoid tracking and updating OpenAI and vLLM
+/// parameter additions/changes. Full validation is delegated to
+/// the downstream server implementation.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletionsRequest {
+    /// Stream parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Model name.
+    pub model: String,
+    /// Prompt text.
+    pub prompt: String,
+    /// Extra fields not captured above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl CompletionsRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.model.is_empty() {
+            return Err(ValidationError::Invalid("`model` must not be empty".into()));
+        }
+        if self.prompt.is_empty() {
+            return Err(ValidationError::Invalid(
+                "`prompt` must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Detector config.
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetectorConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<HashMap<String, DetectorParams>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<HashMap<String, DetectorParams>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub input: HashMap<String, DetectorParams>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub output: HashMap<String, DetectorParams>,
 }
 
+/// Response format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFormat {
     /// The type of response format being defined.
@@ -312,6 +341,7 @@ pub struct ResponseFormat {
     pub json_schema: HashMap<String, serde_json::Value>,
 }
 
+/// Tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     /// The type of the tool.
@@ -320,6 +350,7 @@ pub struct Tool {
     pub function: ToolFunction,
 }
 
+/// Tool function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolFunction {
     /// The name of the function to be called.
@@ -336,6 +367,7 @@ pub struct ToolFunction {
     pub strict: Option<bool>,
 }
 
+/// Tool choice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolChoice {
@@ -347,6 +379,7 @@ pub enum ToolChoice {
     Object(ToolChoiceObject),
 }
 
+/// Tool choice object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolChoiceObject {
     /// The type of the tool.
@@ -355,6 +388,7 @@ pub struct ToolChoiceObject {
     pub function: Function,
 }
 
+/// Stream options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOptions {
     /// If set, an additional chunk will be streamed before the data: [DONE] message.
@@ -365,6 +399,7 @@ pub struct StreamOptions {
     pub include_usage: Option<bool>,
 }
 
+/// Role.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -376,7 +411,8 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Message.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Message {
     /// The role of the author of this message.
@@ -398,6 +434,33 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+impl Message {
+    /// Checks if text content of a message is empty.
+    ///
+    /// The following messages are considered empty:
+    /// 1. [`Message::content`] is None.
+    /// 2. [`Message::content`] is an empty string.
+    /// 3. [`Message::content`] is an empty array.
+    /// 4. [`Message::content`] is an array of empty strings and ContentType is Text.
+    pub fn is_text_content_empty(&self) -> bool {
+        match &self.content {
+            Some(content) => match content {
+                Content::Text(string) => string.is_empty(),
+                Content::Array(content_parts) => {
+                    content_parts.is_empty()
+                        || content_parts.iter().all(|content_part| {
+                            content_part.text.is_none()
+                                || (content_part.r#type == ContentType::Text
+                                    && content_part.text.as_ref().unwrap().is_empty())
+                        })
+                }
+            },
+            None => true,
+        }
+    }
+}
+
+/// Content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Content {
@@ -442,6 +505,7 @@ impl From<Vec<String>> for Content {
     }
 }
 
+/// Content type.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ContentType {
     #[serde(rename = "text")]
@@ -451,6 +515,7 @@ pub enum ContentType {
     ImageUrl,
 }
 
+/// Content part.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContentPart {
     /// The type of the content part.
@@ -467,6 +532,7 @@ pub struct ContentPart {
     pub refusal: Option<String>,
 }
 
+/// Image url.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageUrl {
     /// Either a URL of the image or the base64 encoded image data.
@@ -476,7 +542,8 @@ pub struct ImageUrl {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     /// The ID of the tool call.
     pub id: String,
@@ -487,7 +554,8 @@ pub struct ToolCall {
     pub function: Function,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Function.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Function {
     /// The name of the function to call.
     pub name: String,
@@ -496,8 +564,8 @@ pub struct Function {
     pub arguments: Option<String>,
 }
 
-/// Represents a chat completion response returned by model, based on the provided input.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Chat completion response.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletion {
     /// A unique identifier for the chat completion.
     pub id: String,
@@ -511,6 +579,8 @@ pub struct ChatCompletion {
     pub choices: Vec<ChatCompletionChoice>,
     /// Usage statistics for the completion request.
     pub usage: Usage,
+    /// Prompt logprobs.
+    pub prompt_logprobs: Option<Vec<Option<HashMap<String, Logprob>>>>,
     /// This fingerprint represents the backend configuration that the model runs with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
@@ -526,8 +596,8 @@ pub struct ChatCompletion {
     pub warnings: Vec<OrchestratorWarning>,
 }
 
-/// A chat completion choice.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Chat completion choice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionChoice {
     /// The index of the choice in the list of choices.
     pub index: u32,
@@ -537,10 +607,12 @@ pub struct ChatCompletionChoice {
     pub logprobs: Option<ChatCompletionLogprobs>,
     /// The reason the model stopped generating tokens.
     pub finish_reason: String,
+    /// The stop string or token id that caused the completion.
+    pub stop_reason: Option<String>,
 }
 
-/// A chat completion message generated by the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Chat completion message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionMessage {
     /// The role of the author of this message.
     pub role: Role,
@@ -554,7 +626,8 @@ pub struct ChatCompletionMessage {
     pub refusal: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Chat completion logprobs.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChatCompletionLogprobs {
     /// A list of message content tokens with log probability information.
     pub content: Option<Vec<ChatCompletionLogprob>>,
@@ -563,8 +636,8 @@ pub struct ChatCompletionLogprobs {
     pub refusal: Option<Vec<ChatCompletionLogprob>>,
 }
 
-/// Log probability information for a choice.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Chat completion logprob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionLogprob {
     /// The token.
     pub token: String,
@@ -577,7 +650,8 @@ pub struct ChatCompletionLogprob {
     pub top_logprobs: Option<Vec<ChatCompletionTopLogprob>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Chat completion top logprob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionTopLogprob {
     /// The token.
     pub token: String,
@@ -585,7 +659,7 @@ pub struct ChatCompletionTopLogprob {
     pub logprob: f32,
 }
 
-/// Represents a streamed chunk of a chat completion response returned by model, based on the provided input.
+/// Streaming chat completion chunk.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunk {
     /// A unique identifier for the chat completion. Each chunk has the same ID.
@@ -615,6 +689,7 @@ pub struct ChatCompletionChunk {
     pub warnings: Vec<OrchestratorWarning>,
 }
 
+/// Streaming chat completion chunk choice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunkChoice {
     /// The index of the choice in the list of choices.
@@ -625,9 +700,11 @@ pub struct ChatCompletionChunkChoice {
     pub logprobs: Option<ChatCompletionLogprobs>,
     /// The reason the model stopped generating tokens.
     pub finish_reason: Option<String>,
+    /// The stop string or token id that caused the completion.
+    pub stop_reason: Option<String>,
 }
 
-/// A chat completion delta generated by streamed model responses.
+/// Streaming chat completion delta.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionDelta {
     /// The role of the author of this message.
@@ -644,8 +721,70 @@ pub struct ChatCompletionDelta {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// Usage statistics for a completion.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Completion (legacy) response. Also used for streaming.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Completion {
+    /// A unique identifier for the completion.
+    pub id: String,
+    /// The object type, which is always `text_completion`.
+    pub object: String,
+    /// The Unix timestamp (in seconds) of when the chat completion was created.
+    pub created: i64,
+    /// The model used for the completion.
+    pub model: String,
+    /// A list of completion choices. Can be more than one if n is greater than 1.
+    pub choices: Vec<CompletionChoice>,
+    /// Usage statistics for the completion request.
+    pub usage: Option<Usage>,
+    /// This fingerprint represents the backend configuration that the model runs with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+}
+
+/// Completion (legacy) choice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompletionChoice {
+    /// The index of the choice in the list of choices.
+    pub index: u32,
+    /// Text generated by the model.
+    pub text: String,
+    /// Log probability information for the choice.
+    pub logprobs: Option<CompletionLogprobs>,
+    /// The reason the model stopped generating tokens.
+    pub finish_reason: Option<String>,
+    /// The stop string or token id that caused the completion.
+    pub stop_reason: Option<String>,
+    /// Prompt logprobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<Vec<Option<HashMap<String, Logprob>>>>,
+}
+
+/// Completion logprobs.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct CompletionLogprobs {
+    /// Tokens generated by the model.
+    pub tokens: Vec<String>,
+    /// Token logprobs.
+    pub token_logprobs: Vec<f32>,
+    /// Top logprobs.
+    pub top_logprobs: Vec<HashMap<String, f32>>,
+    /// Text offsets.
+    pub text_offset: Vec<u32>,
+}
+
+/// Logprob.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Logprob {
+    /// The logprob of the chosen token
+    pub logprob: f32,
+    /// The vocab rank of the chosen token (>=1)
+    pub rank: Option<i32>,
+    /// The decoded chosen token index
+    pub decoded_token: Option<String>,
+}
+
+/// Completion usage statistics.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     /// Number of tokens in the prompt.
     pub prompt_tokens: u32,
@@ -661,18 +800,21 @@ pub struct Usage {
     pub completion_token_details: Option<CompletionTokenDetails>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Completion token details.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompletionTokenDetails {
     pub audio_tokens: u32,
     pub reasoning_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Prompt token details.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PromptTokenDetails {
     pub audio_tokens: u32,
     pub cached_tokens: u32,
 }
 
+/// Stop tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StopTokens {
@@ -680,6 +822,7 @@ pub enum StopTokens {
     String(String),
 }
 
+/// OpenAI error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiError {
     pub object: Option<String>,
@@ -690,8 +833,8 @@ pub struct OpenAiError {
     pub code: u16,
 }
 
-/// Guardrails detection results.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Guardrails chat detections.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatDetections {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<InputDetectionResult>,
@@ -699,32 +842,24 @@ pub struct ChatDetections {
     pub output: Vec<OutputDetectionResult>,
 }
 
-/// Guardrails detection result for application on input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Guardrails chat input detections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InputDetectionResult {
     pub message_index: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<ContentAnalysisResponse>,
 }
 
-/// Guardrails detection result for application output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Guardrails chat output detections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutputDetectionResult {
     pub choice_index: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<ContentAnalysisResponse>,
 }
 
-/// Represents the input and output of detection results following processing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetectionResult {
-    pub index: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub results: Vec<ContentAnalysisResponse>,
-}
-
-/// Warnings generated by guardrails.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Guardrails warning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OrchestratorWarning {
     r#type: DetectionWarningReason,
     message: String,
@@ -736,5 +871,116 @@ impl OrchestratorWarning {
             r#type: warning_type,
             message: message.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn test_chat_completions_request() -> Result<(), serde_json::Error> {
+        // Test deserialize
+        let detectors = DetectorConfig {
+            input: HashMap::from([("some_detector".into(), DetectorParams::new())]),
+            output: HashMap::new(),
+        };
+        let messages = vec![Message {
+            content: Some(Content::Text("Hi there!".to_string())),
+            ..Default::default()
+        }];
+        let json_request = json!({
+            "model": "test",
+            "detectors": detectors,
+            "messages": messages,
+            "frequency_penalty": 2.0,
+        });
+        let request = ChatCompletionsRequest::deserialize(&json_request)?;
+        let mut extra = Map::new();
+        extra.insert("frequency_penalty".into(), 2.0.into());
+        assert_eq!(
+            request,
+            ChatCompletionsRequest {
+                detectors,
+                stream: None,
+                model: "test".into(),
+                messages: messages.clone(),
+                extra,
+            }
+        );
+
+        // Test deserialize with no detectors
+        let json_request = json!({
+            "model": "test",
+            "messages": messages,
+        });
+        let request = ChatCompletionsRequest::deserialize(&json_request)?;
+        assert_eq!(
+            request,
+            ChatCompletionsRequest {
+                detectors: DetectorConfig::default(),
+                stream: None,
+                model: "test".into(),
+                messages: messages.clone(),
+                extra: Map::new(),
+            }
+        );
+
+        // Test deserialize errors
+        let result = ChatCompletionsRequest::deserialize(json!({
+            "detectors": DetectorConfig::default(),
+            "messages": messages,
+        }));
+        assert!(result.is_err_and(|error| error.to_string().starts_with("missing field `model`")));
+
+        let result = ChatCompletionsRequest::deserialize(json!({
+            "model": "test",
+            "detectors": DetectorConfig::default(),
+            "messages": ["invalid"],
+        }));
+        assert!(result.is_err_and(|error| error.to_string()
+            == "invalid type: string \"invalid\", expected struct Message"));
+
+        // Test validation errors
+        let request = ChatCompletionsRequest::deserialize(json!({
+            "model": "",
+            "detectors": DetectorConfig::default(),
+            "messages": Vec::<Message>::default(),
+        }))?;
+        let result = request.validate();
+        assert!(result.is_err_and(|error| error.to_string() == "`model` must not be empty"));
+
+        let request = ChatCompletionsRequest::deserialize(json!({
+            "model": "test",
+            "detectors": DetectorConfig::default(),
+            "messages": Vec::<Message>::default(),
+        }))?;
+        let result = request.validate();
+        assert!(result.is_err_and(|error| error.to_string() == "`messages` must not be empty"));
+
+        // Test serialize
+        let request = ChatCompletionsRequest::deserialize(&json!({
+            "model": "test",
+            "detectors": {
+                "input": {"some_detector": {}},
+                "output": {},
+            },
+            "messages": [{"role": "user", "content": "Hi there!"}],
+            "frequency_penalty": 2.0,
+        }))?;
+        let serialized_request = serde_json::to_value(request)?;
+        // should include stream: false and exclude detectors
+        assert_eq!(
+            serialized_request,
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "Hi there!"}],
+                "frequency_penalty": 2.0,
+            })
+        );
+
+        Ok(())
     }
 }

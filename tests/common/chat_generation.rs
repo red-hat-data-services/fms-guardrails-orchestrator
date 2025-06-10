@@ -15,4 +15,5 @@
 
 */
 
-pub mod content;
+// Chat completions server endpoint
+pub const CHAT_COMPLETIONS_ENDPOINT: &str = "/v1/chat/completions";

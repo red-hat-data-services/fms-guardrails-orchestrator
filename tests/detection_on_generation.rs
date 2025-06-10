@@ -18,11 +18,14 @@
 use std::collections::HashMap;
 
 use common::{
-    detectors::{ANSWER_RELEVANCE_DETECTOR, DETECTION_ON_GENERATION_DETECTOR_ENDPOINT},
+    detectors::{
+        ANSWER_RELEVANCE_DETECTOR, DETECTION_ON_GENERATION_DETECTOR_ENDPOINT,
+        FACT_CHECKING_DETECTOR_SENTENCE, NON_EXISTING_DETECTOR,
+    },
     errors::{DetectorError, OrchestratorError},
     orchestrator::{
         ORCHESTRATOR_CONFIG_FILE_PATH, ORCHESTRATOR_DETECTION_ON_GENERATION_ENDPOINT,
-        ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE, TestOrchestratorServer,
+        TestOrchestratorServer,
     },
 };
 use fms_guardrails_orchestr8::{
@@ -65,7 +68,7 @@ async fn no_detections() -> Result<(), anyhow::Error> {
                 generated_text: generated_text.into(),
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![detection.clone()]);
+        then.json([&detection]);
     });
 
     // Start orchestrator server and its dependencies
@@ -125,7 +128,7 @@ async fn detections() -> Result<(), anyhow::Error> {
                 generated_text: generated_text.into(),
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![detection.clone()]);
+        then.json([&detection]);
     });
 
     // Start orchestrator server and its dependencies
@@ -209,8 +212,7 @@ async fn client_error() -> Result<(), anyhow::Error> {
     // assertions
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let response = response.json::<OrchestratorError>().await?;
-    assert_eq!(response.code, detector_error.code);
-    assert_eq!(response.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(response, OrchestratorError::internal());
 
     Ok(())
 }
@@ -315,8 +317,56 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let response = response.json::<OrchestratorError>().await?;
     debug!("{response:#?}");
-    assert_eq!(response.code, 422);
-    assert_eq!(response.details, "`detectors` is required");
+    assert_eq!(
+        response,
+        OrchestratorError::required("detectors"),
+        "failed on empty `detectors` scenario"
+    );
+
+    // asserts requests with invalid detector type
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_DETECTION_ON_GENERATION_ENDPOINT)
+        .json(&DetectionOnGeneratedHttpRequest {
+            prompt: prompt.into(),
+            generated_text: generated_text.into(),
+            detectors: HashMap::from([(
+                FACT_CHECKING_DETECTOR_SENTENCE.into(),
+                DetectorParams::new(),
+            )]),
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(
+        response,
+        OrchestratorError::detector_not_supported(FACT_CHECKING_DETECTOR_SENTENCE),
+        "failed on invalid detector scenario"
+    );
+
+    // asserts requests with non-existing dewtector
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_DETECTION_ON_GENERATION_ENDPOINT)
+        .json(&DetectionOnGeneratedHttpRequest {
+            prompt: prompt.into(),
+            generated_text: generated_text.into(),
+            detectors: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+        })
+        .send()
+        .await?;
+    debug!("{response:#?}");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(
+        response,
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed on non-existing detector scenario"
+    );
 
     Ok(())
 }

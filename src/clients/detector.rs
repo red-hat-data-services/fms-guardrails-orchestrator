@@ -21,12 +21,11 @@ use axum::http::HeaderMap;
 use http::header::CONTENT_TYPE;
 use hyper::StatusCode;
 use serde::Deserialize;
-use tracing::instrument;
 use url::Url;
 
 use super::{
     Error,
-    http::{HttpClientExt, RequestBody, ResponseBody},
+    http::{HttpClientExt, JSON_CONTENT_TYPE, RequestBody, ResponseBody},
 };
 
 pub mod text_contents;
@@ -79,17 +78,15 @@ pub trait DetectorClientExt: HttpClientExt {
 }
 
 impl<C: DetectorClient + HttpClientExt> DetectorClientExt for C {
-    #[instrument(skip_all, fields(model_id, url))]
     async fn post_to_detector<U: ResponseBody>(
         &self,
         model_id: &str,
         url: Url,
-        headers: HeaderMap,
+        mut headers: HeaderMap,
         request: impl RequestBody,
     ) -> Result<U, Error> {
-        let mut headers = headers;
         headers.append(DETECTOR_ID_HEADER_NAME, model_id.parse().unwrap());
-        headers.append(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.append(CONTENT_TYPE, JSON_CONTENT_TYPE);
         // Header used by a router component, if available
         headers.append(MODEL_HEADER_NAME, model_id.parse().unwrap());
 

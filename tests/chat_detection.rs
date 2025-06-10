@@ -17,11 +17,13 @@
 use std::collections::{BTreeMap, HashMap};
 
 use common::{
-    detectors::{CHAT_DETECTOR_ENDPOINT, PII_DETECTOR},
+    detectors::{
+        ANSWER_RELEVANCE_DETECTOR_SENTENCE, CHAT_DETECTOR_ENDPOINT, NON_EXISTING_DETECTOR,
+        PII_DETECTOR,
+    },
     errors::{DetectorError, OrchestratorError},
     orchestrator::{
-        ORCHESTRATOR_CHAT_DETECTION_ENDPOINT, ORCHESTRATOR_CONFIG_FILE_PATH,
-        ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE, TestOrchestratorServer,
+        ORCHESTRATOR_CHAT_DETECTION_ENDPOINT, ORCHESTRATOR_CONFIG_FILE_PATH, TestOrchestratorServer,
     },
 };
 use fms_guardrails_orchestr8::{
@@ -58,7 +60,6 @@ async fn no_detections() -> Result<(), anyhow::Error> {
         },
     ];
     let parameters = BTreeMap::from([("id".into(), "a".into()), ("type".into(), "b".into())]);
-    // tools are just passed through to the detector
     let tools = vec![Tool {
         r#type: "function".into(),
         function: ToolFunction {
@@ -87,7 +88,7 @@ async fn no_detections() -> Result<(), anyhow::Error> {
                 tools: tools.clone(),
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![detection.clone()]);
+        then.json([&detection]);
     });
 
     // Start orchestrator server and its dependencies
@@ -157,7 +158,7 @@ async fn detections() -> Result<(), anyhow::Error> {
                 tools: vec![],
                 detector_params: DetectorParams::new(),
             });
-        then.json(vec![detection.clone()]);
+        then.json([&detection]);
     });
 
     // Start orchestrator server and its dependencies
@@ -252,8 +253,7 @@ async fn client_errors() -> Result<(), anyhow::Error> {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let response = response.json::<OrchestratorError>().await?;
     debug!("{response:#?}");
-    assert_eq!(response.code, 500);
-    assert_eq!(response.details, ORCHESTRATOR_INTERNAL_SERVER_ERROR_MESSAGE);
+    assert_eq!(response, OrchestratorError::internal());
 
     Ok(())
 }
@@ -380,10 +380,68 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         }))
         .send()
         .await?;
+
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
     assert_eq!(response.code, 422);
     assert!(response.details.contains("Message content cannot be empty"));
+
+    // Asserts requests with detector with invalid type return 422
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: Some(Content::Text("Hi there!".into())),
+            ..Default::default()
+        },
+        Message {
+            role: Role::Assistant,
+            content: Some(Content::Text("Hello!".into())),
+            ..Default::default()
+        },
+    ];
+
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_CHAT_DETECTION_ENDPOINT)
+        .json(&ChatDetectionHttpRequest {
+            detectors: HashMap::from([(
+                ANSWER_RELEVANCE_DETECTOR_SENTENCE.into(),
+                DetectorParams::new(),
+            )]),
+            messages: messages.clone(),
+            tools: vec![],
+        })
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(
+        response,
+        OrchestratorError::detector_not_supported(ANSWER_RELEVANCE_DETECTOR_SENTENCE),
+        "failed on detector with invalid type scenario"
+    );
+
+    // Asserts requests with non-existing detector return 422
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_CHAT_DETECTION_ENDPOINT)
+        .json(&ChatDetectionHttpRequest {
+            detectors: HashMap::from([(NON_EXISTING_DETECTOR.into(), DetectorParams::new())]),
+            messages: messages.clone(),
+            tools: vec![],
+        })
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = response.json::<OrchestratorError>().await?;
+    debug!("{response:#?}");
+    assert_eq!(
+        response,
+        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        "failed on non-existing detector scenario"
+    );
 
     Ok(())
 }
