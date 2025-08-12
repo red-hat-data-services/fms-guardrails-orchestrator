@@ -37,11 +37,19 @@ RUN cd /tmp && \
         curl -L -O https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-aarch_64.zip; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         curl -L -O https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip; \
+    elif [ "$TARGETARCH" = "ppc64le" ]; then \
+        microdnf update && \
+        microdnf install -y cmake clang && \
+        curl -L -O https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-ppcle_64.zip; \
     else \
         echo "Unsupported TARGETARCH: $TARGETARCH (only amd64 and arm64 are supported)" >&2; exit 1; \
     fi && \
     unzip protoc-*.zip -d /usr/local && rm protoc-*.zip
-ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib/
+
+# Find libclang.so (resolves differences across architectures)
+RUN ln -s $(ldconfig -p | grep libclang.so | awk '{print $4}' | head -n1) /usr/lib64/libclang.so || true
+
+ENV LIBCLANG_PATH=/usr/lib64/
 
 WORKDIR /app
 
