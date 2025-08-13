@@ -23,7 +23,10 @@ use std::{
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use crate::clients::{chunker::DEFAULT_CHUNKER_ID, is_valid_hostname};
+use crate::{
+    clients::{chunker::DEFAULT_CHUNKER_ID, is_valid_hostname},
+    utils::one_or_many,
+};
 
 /// Default allowed headers to passthrough to clients.
 const DEFAULT_ALLOWED_HEADERS: &[&str] = &[];
@@ -76,6 +79,12 @@ pub struct ServiceConfig {
     pub tls: Option<Tls>,
     /// gRPC probe interval in seconds
     pub grpc_dns_probe_interval: Option<u64>,
+    /// Resolution strategy
+    pub resolution_strategy: Option<String>,
+    /// Resolution strategy timeout in seconds
+    pub resolution_strategy_timeout: Option<u64>,
+    /// Max retries for client calls [currently only for grpc generation]
+    pub max_retries: Option<usize>,
 }
 
 impl ServiceConfig {
@@ -86,6 +95,9 @@ impl ServiceConfig {
             request_timeout: None,
             tls: None,
             grpc_dns_probe_interval: None,
+            resolution_strategy: None,
+            resolution_strategy_timeout: None,
+            max_retries: None,
         }
     }
 }
@@ -126,9 +138,9 @@ pub struct GenerationConfig {
     pub service: ServiceConfig,
 }
 
-/// Chat generation service configuration
+/// OpenAI service configuration
 #[derive(Default, Clone, Debug, Deserialize)]
-pub struct ChatGenerationConfig {
+pub struct OpenAiConfig {
     /// Generation service connection information
     pub service: ServiceConfig,
     /// Generation health service connection information
@@ -165,8 +177,8 @@ pub struct DetectorConfig {
     /// Default threshold with which to filter detector results by score
     pub default_threshold: f64,
     /// Type of detection this detector performs
-    #[serde(rename = "type")]
-    pub r#type: DetectorType,
+    #[serde(rename = "type", deserialize_with = "one_or_many")]
+    pub r#type: Vec<DetectorType>,
 }
 
 #[derive(Default, Clone, Debug, Deserialize, PartialEq)]
@@ -185,8 +197,10 @@ pub enum DetectorType {
 pub struct OrchestratorConfig {
     /// Generation service and associated configuration, can be omitted if configuring for generation is not wanted
     pub generation: Option<GenerationConfig>,
-    /// Chat generation service and associated configuration, can be omitted if configuring for chat generation is not wanted
-    pub chat_generation: Option<ChatGenerationConfig>,
+    /// OpenAI service and associated configuration, can be omitted if configuring for chat generation is not wanted
+    #[serde(alias = "chat_generation")]
+    #[serde(alias = "chat_completions")]
+    pub openai: Option<OpenAiConfig>,
     /// Chunker services and associated configurations, if omitted the default value "whole_doc_chunker" is used
     pub chunkers: Option<HashMap<String, ChunkerConfig>>,
     /// Detector services and associated configurations
@@ -215,6 +229,17 @@ impl OrchestratorConfig {
                 error,
             }
         })?;
+        // TODO: Remove if conditions once aliases are deprecated
+        if config_yaml.contains("chat_generation") {
+            warn!(
+                "`chat_generation` is deprecated and will be removed in 1.0. Rename it to `openai`."
+            )
+        }
+        if config_yaml.contains("chat_completions") {
+            warn!(
+                "`chat_completions` is deprecated and will be removed in 1.0. Rename it to `openai`."
+            )
+        }
         let mut config: OrchestratorConfig =
             serde_yml::from_str(&config_yaml).map_err(Error::InvalidConfigFile)?;
         debug!(?config, "loaded orchestrator config");
@@ -260,9 +285,9 @@ impl OrchestratorConfig {
             if let Some(generation) = &mut self.generation {
                 apply_named_tls_config(&mut generation.service, tls_configs)?;
             }
-            // Chat generation
-            if let Some(chat_generation) = &mut self.chat_generation {
-                apply_named_tls_config(&mut chat_generation.service, tls_configs)?;
+            // Open AI
+            if let Some(openai) = &mut self.openai {
+                apply_named_tls_config(&mut openai.service, tls_configs)?;
             }
             // Chunkers
             if let Some(chunkers) = &mut self.chunkers {
@@ -286,7 +311,7 @@ impl OrchestratorConfig {
 
         // Apply validation rules
         self.validate_generation_config()?;
-        self.validate_chat_generation_config()?;
+        self.validate_openai_configs()?;
         self.validate_detector_configs()?;
         self.validate_chunker_configs()?;
 
@@ -307,15 +332,16 @@ impl OrchestratorConfig {
     }
 
     /// Validates chat generation config.
-    fn validate_chat_generation_config(&self) -> Result<(), Error> {
-        if let Some(chat_generation) = &self.chat_generation {
+    fn validate_openai_configs(&self) -> Result<(), Error> {
+        if let Some(openai) = &self.openai {
             // Hostname is valid
-            if !is_valid_hostname(&chat_generation.service.hostname) {
+            if !is_valid_hostname(&openai.service.hostname) {
                 return Err(Error::InvalidHostname(
-                    "`chat_generation` has an invalid hostname".into(),
+                    "`openai` has an invalid hostname".into(),
                 ));
             }
         }
+
         Ok(())
     }
 
@@ -385,7 +411,7 @@ impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             generation: None,
-            chat_generation: None,
+            openai: None,
             chunkers: None,
             detectors: HashMap::default(),
             tls: None,

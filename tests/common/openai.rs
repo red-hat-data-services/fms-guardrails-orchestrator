@@ -17,3 +17,5 @@
 
 // Chat completions server endpoint
 pub const CHAT_COMPLETIONS_ENDPOINT: &str = "/v1/chat/completions";
+pub const COMPLETIONS_ENDPOINT: &str = "/v1/completions";
+pub const TOKENIZE_ENDPOINT: &str = "/tokenize";
