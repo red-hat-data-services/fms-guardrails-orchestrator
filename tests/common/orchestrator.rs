@@ -58,6 +58,7 @@ pub const ORCHESTRATOR_CHAT_DETECTION_ENDPOINT: &str = "/api/v2/text/detection/c
 
 pub const ORCHESTRATOR_CHAT_COMPLETIONS_DETECTION_ENDPOINT: &str =
     "/api/v2/chat/completions-detection";
+pub const ORCHESTRATOR_COMPLETIONS_DETECTION_ENDPOINT: &str = "/api/v2/text/completions-detection";
 
 // Messages
 pub const ORCHESTRATOR_UNSUITABLE_INPUT_MESSAGE: &str = "Unsuitable input detected. Please check the detected entities on your input and try again with the unsuitable input removed.";
@@ -72,7 +73,7 @@ pub struct TestOrchestratorServerBuilder<'a> {
     port: Option<u16>,
     health_port: Option<u16>,
     generation_server: Option<&'a MockServer>,
-    chat_generation_server: Option<&'a MockServer>,
+    openai_server: Option<&'a MockServer>,
     detector_servers: Option<Vec<&'a MockServer>>,
     chunker_servers: Option<Vec<&'a MockServer>>,
 }
@@ -102,8 +103,8 @@ impl<'a> TestOrchestratorServerBuilder<'a> {
         self
     }
 
-    pub fn chat_generation_server(mut self, server: &'a MockServer) -> Self {
-        self.chat_generation_server = Some(server);
+    pub fn openai_server(mut self, server: &'a MockServer) -> Self {
+        self.openai_server = Some(server);
         self
     }
 
@@ -126,7 +127,7 @@ impl<'a> TestOrchestratorServerBuilder<'a> {
 
         // Start & configure mock servers
         initialize_generation_server(self.generation_server, &mut config).await?;
-        initialize_chat_generation_server(self.chat_generation_server, &mut config).await?;
+        initialize_openai_server(self.openai_server, &mut config).await?;
         initialize_detectors(self.detector_servers.as_deref(), &mut config).await?;
         initialize_chunkers(self.chunker_servers.as_deref(), &mut config).await?;
 
@@ -169,7 +170,7 @@ impl TestOrchestratorServer {
                         client: reqwest::Client::builder().build().unwrap(),
                     });
                 }
-                Err(server::Error::IoError(error)) => {
+                Err(error) if error.details().starts_with("io error") => {
                     warn!(%error, "failed to start server, trying again with different ports...");
                     continue;
                 }
@@ -214,14 +215,13 @@ async fn initialize_generation_server(
 }
 
 /// Starts and configures chat generation server.
-async fn initialize_chat_generation_server(
-    chat_generation_server: Option<&MockServer>,
+async fn initialize_openai_server(
+    openai_server: Option<&MockServer>,
     config: &mut OrchestratorConfig,
 ) -> Result<(), anyhow::Error> {
-    if let Some(chat_generation_server) = chat_generation_server {
-        chat_generation_server.start().await?;
-        config.chat_generation.as_mut().unwrap().service.port =
-            Some(chat_generation_server.addr().unwrap().port());
+    if let Some(openai_server) = openai_server {
+        openai_server.start().await?;
+        config.openai.as_mut().unwrap().service.port = Some(openai_server.addr().unwrap().port());
     };
     Ok(())
 }
@@ -285,7 +285,7 @@ impl<T> Stream for SseStream<'_, T>
 where
     T: DeserializeOwned,
 {
-    type Item = Result<T, anyhow::Error>;
+    type Item = Result<T, server::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.get_mut().stream).poll_next(cx) {
@@ -293,12 +293,30 @@ where
                 if event.data == "[DONE]" {
                     return Poll::Ready(None);
                 }
+                if event.event == "error" {
+                    let error: server::Error = serde_json::from_str(&event.data).unwrap();
+                    return Poll::Ready(Some(Err(error)));
+                }
                 match serde_json::from_str::<T>(&event.data) {
                     Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                    Err(error) => Poll::Ready(Some(Err(error.into()))),
+                    Err(error) => {
+                        let error = server::Error {
+                            code: http::StatusCode::INTERNAL_SERVER_ERROR,
+                            details: format!(
+                                "sse_stream error: `event.data` deserialization failed {error}"
+                            ),
+                        };
+                        Poll::Ready(Some(Err(error)))
+                    }
                 }
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(Some(Err(error))) => {
+                let error = server::Error {
+                    code: http::StatusCode::INTERNAL_SERVER_ERROR,
+                    details: format!("sse_stream error: error parsing event {error}"),
+                };
+                Poll::Ready(Some(Err(error)))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }

@@ -27,16 +27,14 @@ use tracing::{debug, info};
 
 use crate::{
     clients::{
-        ClientMap, GenerationClient, NlpClient, TextContentsDetectorClient, TgisClient,
-        chunker::ChunkerClient,
-        detector::{
-            TextChatDetectorClient, TextContextDocDetectorClient, TextGenerationDetectorClient,
-        },
+        ChunkerClient, ClientMap, DetectorClient, GenerationClient, NlpClient, TgisClient,
         openai::OpenAiClient,
     },
-    config::{DetectorType, GenerationProvider, OrchestratorConfig},
+    config::{GenerationProvider, OrchestratorConfig},
     health::HealthCheckCache,
 };
+
+const DEFAULT_MAX_RETRIES: usize = 3;
 
 #[cfg_attr(test, derive(Default))]
 pub struct Context {
@@ -120,28 +118,29 @@ async fn create_clients(config: &OrchestratorConfig) -> Result<ClientMap, Error>
 
     // Create generation client
     if let Some(generation) = &config.generation {
+        let retries = generation
+            .service
+            .max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES);
         match generation.provider {
             GenerationProvider::Tgis => {
                 let tgis_client = TgisClient::new(&generation.service).await;
-                let generation_client = GenerationClient::tgis(tgis_client);
+                let generation_client = GenerationClient::tgis(tgis_client, retries);
                 clients.insert("generation".to_string(), generation_client);
             }
             GenerationProvider::Nlp => {
                 let nlp_client = NlpClient::new(&generation.service).await;
-                let generation_client = GenerationClient::nlp(nlp_client);
+                let generation_client = GenerationClient::nlp(nlp_client, retries);
                 clients.insert("generation".to_string(), generation_client);
             }
         }
     }
 
-    // Create chat generation client
-    if let Some(chat_generation) = &config.chat_generation {
-        let openai_client = OpenAiClient::new(
-            &chat_generation.service,
-            chat_generation.health_service.as_ref(),
-        )
-        .await?;
-        clients.insert("chat_generation".to_string(), openai_client);
+    // Create chat completions client
+    if let Some(openai) = &config.openai {
+        let openai_client =
+            OpenAiClient::new(&openai.service, openai.health_service.as_ref()).await?;
+        clients.insert("openai".to_string(), openai_client);
     }
 
     // Create chunker clients
@@ -154,48 +153,10 @@ async fn create_clients(config: &OrchestratorConfig) -> Result<ClientMap, Error>
 
     // Create detector clients
     for (detector_id, detector) in &config.detectors {
-        match detector.r#type {
-            DetectorType::TextContents => {
-                clients.insert(
-                    detector_id.into(),
-                    TextContentsDetectorClient::new(
-                        &detector.service,
-                        detector.health_service.as_ref(),
-                    )
-                    .await?,
-                );
-            }
-            DetectorType::TextGeneration => {
-                clients.insert(
-                    detector_id.into(),
-                    TextGenerationDetectorClient::new(
-                        &detector.service,
-                        detector.health_service.as_ref(),
-                    )
-                    .await?,
-                );
-            }
-            DetectorType::TextChat => {
-                clients.insert(
-                    detector_id.into(),
-                    TextChatDetectorClient::new(
-                        &detector.service,
-                        detector.health_service.as_ref(),
-                    )
-                    .await?,
-                );
-            }
-            DetectorType::TextContextDoc => {
-                clients.insert(
-                    detector_id.into(),
-                    TextContextDocDetectorClient::new(
-                        &detector.service,
-                        detector.health_service.as_ref(),
-                    )
-                    .await?,
-                );
-            }
-        }
+        clients.insert(
+            detector_id.into(),
+            DetectorClient::new(&detector.service, detector.health_service.as_ref()).await?,
+        );
     }
     Ok(clients)
 }

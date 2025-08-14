@@ -16,14 +16,14 @@
 */
 
 use common::{
-    chat_generation::CHAT_COMPLETIONS_ENDPOINT,
     chunker::CHUNKER_UNARY_ENDPOINT,
     detectors::{
         ANSWER_RELEVANCE_DETECTOR, DETECTOR_NAME_ANGLE_BRACKETS_SENTENCE,
         DETECTOR_NAME_ANGLE_BRACKETS_WHOLE_DOC, NON_EXISTING_DETECTOR,
         TEXT_CONTENTS_DETECTOR_ENDPOINT,
     },
-    errors::{DetectorError, OrchestratorError},
+    errors::DetectorError,
+    openai::CHAT_COMPLETIONS_ENDPOINT,
     orchestrator::{
         ORCHESTRATOR_CHAT_COMPLETIONS_DETECTION_ENDPOINT, ORCHESTRATOR_CONFIG_FILE_PATH,
         TestOrchestratorServer,
@@ -34,9 +34,10 @@ use fms_guardrails_orchestr8::{
         chunker::MODEL_ID_HEADER_NAME as CHUNKER_MODEL_ID_HEADER_NAME,
         detector::{ContentAnalysisRequest, ContentAnalysisResponse},
         openai::{
-            ChatCompletion, ChatCompletionChoice, ChatCompletionMessage, ChatDetections, Content,
-            ContentPart, ContentType, InputDetectionResult, Message, OrchestratorWarning,
-            OutputDetectionResult, Role,
+            ChatCompletion, ChatCompletionChoice, ChatCompletionMessage,
+            CompletionDetectionWarning, CompletionDetections, CompletionInputDetections,
+            CompletionOutputDetections, Content, ContentPart, ContentType, Message, Role,
+            TokenizeResponse,
         },
     },
     models::{
@@ -47,12 +48,15 @@ use fms_guardrails_orchestr8::{
         caikit::runtime::chunkers::ChunkerTokenizationTaskRequest,
         caikit_data_model::nlp::{Token, TokenizationResults},
     },
+    server,
 };
 use hyper::StatusCode;
 use mocktail::prelude::*;
 use serde_json::json;
 use test_log::test;
 use tracing::debug;
+
+use crate::common::openai::TOKENIZE_ENDPOINT;
 
 pub mod common;
 
@@ -123,12 +127,11 @@ async fn no_detectors() -> Result<(), anyhow::Error> {
     });
 
     // Start orchestrator server and its dependencies
-    let mut mock_chat_completions_server =
-        MockServer::new("chat_completions").with_mocks(chat_mocks);
+    let mut mock_openai_server = MockServer::new_http("openai").with_mocks(chat_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
-        .chat_generation_server(&mock_chat_completions_server)
+        .openai_server(&mock_openai_server)
         .build()
         .await?;
 
@@ -222,7 +225,7 @@ async fn no_detectors() -> Result<(), anyhow::Error> {
     ];
 
     // add new mock
-    mock_chat_completions_server.mock(|when, then| {
+    mock_openai_server.mock(|when, then| {
         when.post().path(CHAT_COMPLETIONS_ENDPOINT).json(json!({
             "model": MODEL_ID,
             "messages": messages,
@@ -302,6 +305,7 @@ async fn no_detections() -> Result<(), anyhow::Error> {
             stop_reason: None,
         },
     ];
+
     let chat_completions_response = ChatCompletion {
         model: MODEL_ID.into(),
         choices: expected_choices.clone(),
@@ -341,13 +345,13 @@ async fn no_detections() -> Result<(), anyhow::Error> {
     });
 
     // Start orchestrator server and its dependencies
-    let mock_detector_server = MockServer::new(detector_name).with_mocks(detector_mocks);
-    let mock_chat_completions_server = MockServer::new("chat_completions").with_mocks(chat_mocks);
+    let mock_detector_server = MockServer::new_http(detector_name).with_mocks(detector_mocks);
+    let mock_openai_server = MockServer::new_http("openai").with_mocks(chat_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .detector_servers([&mock_detector_server])
-        .chat_generation_server(&mock_chat_completions_server)
+        .openai_server(&mock_openai_server)
         .build()
         .await?;
 
@@ -369,12 +373,93 @@ async fn no_detections() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    // Assertions for no detections
     assert_eq!(response.status(), StatusCode::OK);
     let results = response.json::<ChatCompletion>().await?;
     assert_eq!(results.choices[0], chat_completions_response.choices[0]);
     assert_eq!(results.choices[1], chat_completions_response.choices[1]);
     assert_eq!(results.warnings, vec![]);
+    assert!(results.detections.is_none());
+
+    // Scenario: output detectors on empty choices responses
+    let messages = vec![Message {
+        content: Some(Content::Text(
+            "Please provide me an empty message".to_string(),
+        )),
+        role: Role::User,
+        ..Default::default()
+    }];
+    let expected_choices = vec![
+        ChatCompletionChoice {
+            message: ChatCompletionMessage {
+                role: Role::Assistant,
+                content: Some("".to_string()),
+                refusal: None,
+                tool_calls: vec![],
+            },
+            index: 0,
+            logprobs: None,
+            finish_reason: "EOS_TOKEN".to_string(),
+            stop_reason: None,
+        },
+        ChatCompletionChoice {
+            message: ChatCompletionMessage {
+                role: Role::Assistant,
+                content: None,
+                refusal: None,
+                tool_calls: vec![],
+            },
+            index: 1,
+            logprobs: None,
+            finish_reason: "EOS_TOKEN".to_string(),
+            stop_reason: None,
+        },
+    ];
+
+    let expected_warnings = vec![
+        CompletionDetectionWarning::new(
+            DetectionWarningReason::EmptyOutput,
+            "Choice of index 0 has no content. Output detection was not executed",
+        ),
+        CompletionDetectionWarning::new(
+            DetectionWarningReason::EmptyOutput,
+            "Choice of index 1 has no content. Output detection was not executed",
+        ),
+    ];
+    let chat_completions_response = ChatCompletion {
+        model: MODEL_ID.into(),
+        choices: expected_choices.clone(),
+        detections: None,
+        ..Default::default()
+    };
+
+    mock_openai_server.mocks().mock(|when, then| {
+        when.post().path(CHAT_COMPLETIONS_ENDPOINT).json(json!({
+            "model": MODEL_ID,
+            "messages": messages,
+        }));
+        then.json(&chat_completions_response);
+    });
+
+    let response = orchestrator_server
+        .post(ORCHESTRATOR_CHAT_COMPLETIONS_DETECTION_ENDPOINT)
+        .json(&json!({
+            "model": MODEL_ID,
+            "detectors": {
+                "output": {
+                    detector_name: {},
+                },
+            },
+            "messages": messages,
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let results = response.json::<ChatCompletion>().await?;
+    debug!("{}", serde_json::to_string_pretty(&results)?);
+    assert_eq!(results.choices[0], chat_completions_response.choices[0]);
+    assert_eq!(results.choices[1], chat_completions_response.choices[1]);
+    assert_eq!(results.warnings, expected_warnings);
     assert!(results.detections.is_none());
 
     Ok(())
@@ -395,7 +480,7 @@ async fn input_detections() -> Result<(), anyhow::Error> {
     // Add mocksets
     let mut detector_mocks = MockSet::new();
     let mut chunker_mocks = MockSet::new();
-    let mut chat_mocks = MockSet::new();
+    let mut openai_mocks = MockSet::new();
 
     // Add input detection mock response for input detection
     let expected_detections = vec![ContentAnalysisResponse {
@@ -413,14 +498,14 @@ async fn input_detections() -> Result<(), anyhow::Error> {
     let chat_completions_response = ChatCompletion {
         model: MODEL_ID.into(),
         choices: vec![],
-        detections: Some(ChatDetections {
-            input: vec![InputDetectionResult {
+        detections: Some(CompletionDetections {
+            input: vec![CompletionInputDetections {
                 message_index: 0,
                 results: expected_detections.clone(),
             }],
             output: vec![],
         }),
-        warnings: vec![OrchestratorWarning::new(
+        warnings: vec![CompletionDetectionWarning::new(
             DetectionWarningReason::UnsuitableInput,
             UNSUITABLE_INPUT_MESSAGE,
         )],
@@ -455,27 +540,35 @@ async fn input_detections() -> Result<(), anyhow::Error> {
         then.json([&expected_detections]);
     });
 
-    // Add chat completions mock
-    chat_mocks.mock(|when, then| {
+    // Add openai mocks
+    openai_mocks.mock(|when, then| {
         when.post().path(CHAT_COMPLETIONS_ENDPOINT).json(json!({
             "model": MODEL_ID,
             "messages": messages,
         }));
         then.json(&chat_completions_response);
     });
+    openai_mocks.mock(|when, then| {
+        when.post().path(TOKENIZE_ENDPOINT).json(json!({
+            "model": MODEL_ID,
+            "prompt": input_text,
+        }));
+        then.json(&TokenizeResponse {
+            count: 12,
+            ..Default::default()
+        });
+    });
 
     // Start orchestrator server and its dependencies
-    let mock_detector_server = MockServer::new(detector_name).with_mocks(detector_mocks);
-    let mock_chat_completions_server = MockServer::new("chat_completions").with_mocks(chat_mocks);
-    let mock_chunker_server = MockServer::new(CHUNKER_NAME_SENTENCE)
-        .grpc()
-        .with_mocks(chunker_mocks);
+    let mock_detector_server = MockServer::new_http(detector_name).with_mocks(detector_mocks);
+    let mock_openai_server = MockServer::new_http("openai").with_mocks(openai_mocks);
+    let mock_chunker_server = MockServer::new_grpc(CHUNKER_NAME_SENTENCE).with_mocks(chunker_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .detector_servers([&mock_detector_server])
         .chunker_servers([&mock_chunker_server])
-        .chat_generation_server(&mock_chat_completions_server)
+        .openai_server(&mock_openai_server)
         .build()
         .await?;
 
@@ -515,7 +608,10 @@ async fn input_client_error() -> Result<(), anyhow::Error> {
         message: "Internal detector error.".into(),
     };
     // Add 500 expected orchestrator error response
-    let expected_orchestrator_error = OrchestratorError::internal();
+    let expected_orchestrator_error = server::Error {
+        code: http::StatusCode::INTERNAL_SERVER_ERROR,
+        details: "unexpected error occurred while processing request".into(),
+    };
 
     // Add input for error scenarios
     let chunker_error_input = "This should return a 500 error on chunker";
@@ -621,17 +717,15 @@ async fn input_client_error() -> Result<(), anyhow::Error> {
     });
 
     // Start orchestrator server and its dependencies
-    let mock_detector_server = MockServer::new(detector_name).with_mocks(detector_mocks);
-    let mock_chat_completions_server = MockServer::new("chat_completions").with_mocks(chat_mocks);
-    let mock_chunker_server = MockServer::new(CHUNKER_NAME_SENTENCE)
-        .grpc()
-        .with_mocks(chunker_mocks);
+    let mock_detector_server = MockServer::new_http(detector_name).with_mocks(detector_mocks);
+    let mock_openai_server = MockServer::new_http("openai").with_mocks(chat_mocks);
+    let mock_chunker_server = MockServer::new_grpc(CHUNKER_NAME_SENTENCE).with_mocks(chunker_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .detector_servers([&mock_detector_server])
         .chunker_servers([&mock_chunker_server])
-        .chat_generation_server(&mock_chat_completions_server)
+        .openai_server(&mock_openai_server)
         .build()
         .await?;
 
@@ -652,7 +746,7 @@ async fn input_client_error() -> Result<(), anyhow::Error> {
         .await?;
 
     // Assertions for chunker error scenario
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     assert_eq!(results, expected_orchestrator_error);
 
     // Make orchestrator call for detector error scenario
@@ -672,7 +766,7 @@ async fn input_client_error() -> Result<(), anyhow::Error> {
         .await?;
 
     // Assertions for detector error scenario
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     assert_eq!(results, expected_orchestrator_error);
 
     // Make orchestrator call for chat completions error scenario
@@ -692,7 +786,7 @@ async fn input_client_error() -> Result<(), anyhow::Error> {
         .await?;
 
     // Assertions for chat completions error scenario
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     assert_eq!(results, expected_orchestrator_error);
 
     Ok(())
@@ -768,14 +862,14 @@ async fn output_detections() -> Result<(), anyhow::Error> {
     let chat_completions_response = ChatCompletion {
         model: MODEL_ID.into(),
         choices: expected_choices.clone(),
-        detections: Some(ChatDetections {
+        detections: Some(CompletionDetections {
             input: vec![],
-            output: vec![OutputDetectionResult {
+            output: vec![CompletionOutputDetections {
                 choice_index: 1,
                 results: expected_detections.clone(),
             }],
         }),
-        warnings: vec![OrchestratorWarning::new(
+        warnings: vec![CompletionDetectionWarning::new(
             DetectionWarningReason::UnsuitableOutput,
             UNSUITABLE_OUTPUT_MESSAGE,
         )],
@@ -848,17 +942,15 @@ async fn output_detections() -> Result<(), anyhow::Error> {
     });
 
     // Start orchestrator server and its dependencies
-    let mock_detector_server = MockServer::new(detector_name).with_mocks(detector_mocks);
-    let mock_chat_completions_server = MockServer::new("chat_completions").with_mocks(chat_mocks);
-    let mock_chunker_server = MockServer::new(CHUNKER_NAME_SENTENCE)
-        .grpc()
-        .with_mocks(chunker_mocks);
+    let mock_detector_server = MockServer::new_http(detector_name).with_mocks(detector_mocks);
+    let mock_openai_server = MockServer::new_http("openai").with_mocks(chat_mocks);
+    let mock_chunker_server = MockServer::new_grpc(CHUNKER_NAME_SENTENCE).with_mocks(chunker_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .detector_servers([&mock_detector_server])
         .chunker_servers([&mock_chunker_server])
-        .chat_generation_server(&mock_chat_completions_server)
+        .openai_server(&mock_openai_server)
         .build()
         .await?;
 
@@ -899,7 +991,10 @@ async fn output_client_error() -> Result<(), anyhow::Error> {
         message: "Internal detector error.".into(),
     };
     // Add 500 expected orchestrator mock response
-    let expected_orchestrator_error = OrchestratorError::internal();
+    let expected_orchestrator_error = server::Error {
+        code: http::StatusCode::INTERNAL_SERVER_ERROR,
+        details: "unexpected error occurred while processing request".into(),
+    };
 
     // Add input for error scenarios
     let chunker_error_input = "This should return a 500 error on chunker";
@@ -1023,17 +1118,15 @@ async fn output_client_error() -> Result<(), anyhow::Error> {
     });
 
     // Start orchestrator server and its dependencies
-    let mock_detector_server = MockServer::new(detector_name).with_mocks(detector_mocks);
-    let mock_chat_completions_server = MockServer::new("chat_completions").with_mocks(chat_mocks);
-    let mock_chunker_server = MockServer::new(CHUNKER_NAME_SENTENCE)
-        .grpc()
-        .with_mocks(chunker_mocks);
+    let mock_detector_server = MockServer::new_http(detector_name).with_mocks(detector_mocks);
+    let mock_openai_server = MockServer::new_http("openai").with_mocks(chat_mocks);
+    let mock_chunker_server = MockServer::new_grpc(CHUNKER_NAME_SENTENCE).with_mocks(chunker_mocks);
 
     let orchestrator_server = TestOrchestratorServer::builder()
         .config_path(ORCHESTRATOR_CONFIG_FILE_PATH)
         .detector_servers([&mock_detector_server])
         .chunker_servers([&mock_chunker_server])
-        .chat_generation_server(&mock_chat_completions_server)
+        .openai_server(&mock_openai_server)
         .build()
         .await?;
 
@@ -1054,7 +1147,7 @@ async fn output_client_error() -> Result<(), anyhow::Error> {
         .await?;
 
     // Assertions for chunker error scenario
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     assert_eq!(results, expected_orchestrator_error);
 
     // Make orchestrator call for detector error scenario
@@ -1074,7 +1167,7 @@ async fn output_client_error() -> Result<(), anyhow::Error> {
         .await?;
 
     // Assertions for detector error scenario
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     assert_eq!(results, expected_orchestrator_error);
 
     // Make orchestrator call for chat completions error scenario
@@ -1094,7 +1187,7 @@ async fn output_client_error() -> Result<(), anyhow::Error> {
         .await?;
 
     // Assertions for chat completions error scenario
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     assert_eq!(results, expected_orchestrator_error);
 
     Ok(())
@@ -1131,11 +1224,16 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError::detector_not_supported(ANSWER_RELEVANCE_DETECTOR),
+        server::Error {
+            code: http::StatusCode::UNPROCESSABLE_ENTITY,
+            details: format!(
+                "detector `{ANSWER_RELEVANCE_DETECTOR}` is not supported by this endpoint",
+            )
+        },
         "failed on invalid input detector scenario"
     );
 
@@ -1155,11 +1253,14 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        server::Error {
+            code: http::StatusCode::NOT_FOUND,
+            details: format!("detector `{NON_EXISTING_DETECTOR}` not found"),
+        },
         "failed on non-existing input detector scenario"
     );
 
@@ -1179,11 +1280,16 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError::detector_not_supported(ANSWER_RELEVANCE_DETECTOR),
+        server::Error {
+            code: http::StatusCode::UNPROCESSABLE_ENTITY,
+            details: format!(
+                "detector `{ANSWER_RELEVANCE_DETECTOR}` is not supported by this endpoint"
+            )
+        },
         "failed on invalid output detector scenario"
     );
 
@@ -1203,11 +1309,14 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError::detector_not_found(NON_EXISTING_DETECTOR),
+        server::Error {
+            code: http::StatusCode::NOT_FOUND,
+            details: format!("detector `{NON_EXISTING_DETECTOR}` not found"),
+        },
         "failed on non-existing input detector scenario"
     );
 
@@ -1239,12 +1348,12 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError {
-            code: 422,
+        server::Error {
+            code: http::StatusCode::UNPROCESSABLE_ENTITY,
             details: "if input detectors are provided, `content` must not be empty on last message"
                 .into()
         }
@@ -1279,12 +1388,12 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError {
-            code: 422,
+        server::Error {
+            code: http::StatusCode::UNPROCESSABLE_ENTITY,
             details: "if input detectors are provided, `content` must not be empty on last message"
                 .into()
         }
@@ -1319,12 +1428,12 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError {
-            code: 422,
+        server::Error {
+            code: http::StatusCode::UNPROCESSABLE_ENTITY,
             details: "Detection on array is not supported".into()
         }
     );
@@ -1371,12 +1480,12 @@ async fn orchestrator_validation_error() -> Result<(), anyhow::Error> {
         .send()
         .await?;
 
-    let results = response.json::<OrchestratorError>().await?;
+    let results = response.json::<server::Error>().await?;
     debug!("{results:#?}");
     assert_eq!(
         results,
-        OrchestratorError {
-            code: 422,
+        server::Error {
+            code: http::StatusCode::UNPROCESSABLE_ENTITY,
             details: "Detection on array is not supported".into()
         }
     );

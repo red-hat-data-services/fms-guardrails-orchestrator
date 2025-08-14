@@ -27,7 +27,7 @@ use std::{
 use async_trait::async_trait;
 use axum::http::{Extensions, HeaderMap};
 use futures::Stream;
-use ginepro::LoadBalancedChannel;
+use ginepro::{LoadBalancedChannel, ResolutionStrategy};
 use hyper_timeout::TimeoutConnector;
 use hyper_util::rt::TokioExecutor;
 use tonic::{Request, metadata::MetadataMap};
@@ -49,9 +49,10 @@ pub mod http;
 pub use http::{HttpClient, http_trace_layer};
 
 pub mod chunker;
+pub use chunker::ChunkerClient;
 
 pub mod detector;
-pub use detector::TextContentsDetectorClient;
+pub use detector::DetectorClient;
 
 pub mod tgis;
 pub use tgis::TgisClient;
@@ -70,6 +71,9 @@ pub mod openai;
 const DEFAULT_CONNECT_TIMEOUT_SEC: u64 = 60;
 const DEFAULT_REQUEST_TIMEOUT_SEC: u64 = 600;
 const DEFAULT_GRPC_PROBE_INTERVAL_SEC: u64 = 10;
+const DEFAULT_RES_STRATEGY_TIMEOUT_SEC: u64 = 10;
+const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL: u64 = 30;
+const DEFAULT_KEEP_ALIVE_TIMEOUT: u64 = 30;
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
@@ -144,27 +148,15 @@ impl ClientMap {
         self.0.insert(key, Box::new(value));
     }
 
-    /// Returns a reference to the client trait object.
+    /// Returns a reference to the concrete client type.
     #[inline]
-    pub fn get(&self, key: &str) -> Option<&dyn Client> {
-        self.0.get(key).map(|v| v.as_ref())
-    }
-
-    /// Returns a mutable reference to the client trait object.
-    #[inline]
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut dyn Client> {
-        self.0.get_mut(key).map(|v| v.as_mut())
-    }
-
-    /// Downcasts and returns a reference to the concrete client type.
-    #[inline]
-    pub fn get_as<V: Client>(&self, key: &str) -> Option<&V> {
+    pub fn get<V: Client>(&self, key: &str) -> Option<&V> {
         self.0.get(key)?.downcast_ref::<V>()
     }
 
-    /// Downcasts and returns a mutable reference to the concrete client type.
+    /// Returns a mutable reference to the concrete client type.
     #[inline]
-    pub fn get_mut_as<V: Client>(&mut self, key: &str) -> Option<&mut V> {
+    pub fn get_mut<V: Client>(&mut self, key: &str) -> Option<&mut V> {
         self.0.get_mut(key)?.downcast_mut::<V>()
     }
 
@@ -215,10 +207,10 @@ pub async fn create_http_client(
         None => "http",
     };
     let mut base_url = Url::parse(&format!("{}://{}", protocol, &service_config.hostname))
-        .unwrap_or_else(|e| panic!("error parsing base url: {}", e));
+        .unwrap_or_else(|e| panic!("error parsing base url: {e}"));
     base_url
         .set_port(Some(port))
-        .unwrap_or_else(|_| panic!("error setting port: {}", port));
+        .unwrap_or_else(|_| panic!("error setting port: {port}"));
 
     let connect_timeout = Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SEC);
     let request_timeout = Duration::from_secs(
@@ -278,11 +270,25 @@ pub async fn create_grpc_client<C: Debug + Clone>(
             .grpc_dns_probe_interval
             .unwrap_or(DEFAULT_GRPC_PROBE_INTERVAL_SEC),
     );
+    let resolution_strategy_timeout = Duration::from_secs(
+        service_config
+            .resolution_strategy_timeout
+            .unwrap_or(DEFAULT_RES_STRATEGY_TIMEOUT_SEC),
+    );
+    let resolution_strategy = match &service_config.resolution_strategy {
+        Some(name) if name == "eager" => ResolutionStrategy::Eager {
+            timeout: resolution_strategy_timeout,
+        },
+        _ => ResolutionStrategy::Lazy,
+    };
     let mut builder = LoadBalancedChannel::builder((service_config.hostname.clone(), port))
         .dns_probe_interval(grpc_dns_probe_interval)
         .connect_timeout(connect_timeout)
-        .timeout(request_timeout);
-
+        .timeout(request_timeout)
+        .keep_alive_while_idle(true)
+        .keep_alive_timeout(Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT))
+        .http2_keep_alive_interval(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL))
+        .resolution_strategy(resolution_strategy);
     let client_tls_config = if let Some(Tls::Config(tls_config)) = &service_config.tls {
         let cert_path = tls_config.cert_path.as_ref().unwrap().as_path();
         let key_path = tls_config.key_path.as_ref().unwrap().as_path();
