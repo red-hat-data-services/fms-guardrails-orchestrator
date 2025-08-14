@@ -43,6 +43,7 @@ const DEFAULT_PORT: u16 = 8080;
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "/v1/chat/completions";
 const COMPLETIONS_ENDPOINT: &str = "/v1/completions";
+const TOKENIZE_ENDPOINT: &str = "/tokenize"; // This endpoint is vLLM-specific
 
 #[derive(Clone)]
 pub struct OpenAiClient {
@@ -76,6 +77,7 @@ impl OpenAiClient {
         request: ChatCompletionsRequest,
         headers: HeaderMap,
     ) -> Result<ChatCompletionsResponse, Error> {
+        tracing::debug!(?headers, "chat_completions headers");
         let url = self.client.endpoint(CHAT_COMPLETIONS_ENDPOINT);
         if let Some(true) = request.stream {
             let rx = self.handle_streaming(url, request, headers).await?;
@@ -101,6 +103,16 @@ impl OpenAiClient {
         }
     }
 
+    pub async fn tokenize(
+        &self,
+        request: TokenizeRequest,
+        headers: HeaderMap,
+    ) -> Result<TokenizeResponse, Error> {
+        let url = self.client.endpoint(TOKENIZE_ENDPOINT);
+        let response = self.handle_unary(url, request, headers).await?;
+        Ok(response)
+    }
+
     async fn handle_unary<R, S>(&self, url: Url, request: R, headers: HeaderMap) -> Result<S, Error>
     where
         R: RequestBody,
@@ -110,6 +122,7 @@ impl OpenAiClient {
         match response.status() {
             StatusCode::OK => response.json::<S>().await,
             _ => {
+                // Return error with code and message from downstream server
                 let code = response.status();
                 let message = if let Ok(response) = response.json::<OpenAiError>().await {
                     response.message
@@ -132,46 +145,73 @@ impl OpenAiClient {
         S: DeserializeOwned + Send + 'static,
     {
         let (tx, rx) = mpsc::channel(32);
-        let mut event_stream = self
-            .client
-            .post(url, headers, request)
-            .await?
-            .0
-            .into_data_stream()
-            .eventsource();
-        // Spawn task to forward events to receiver
-        tokio::spawn(async move {
-            while let Some(result) = event_stream.next().await {
-                match result {
-                    Ok(event) if event.data == "[DONE]" => {
-                        // Send None to signal that the stream completed
-                        let _ = tx.send(Ok(None)).await;
-                        break;
-                    }
-                    Ok(event) => match serde_json::from_str::<S>(&event.data) {
-                        Ok(chunk) => {
-                            let _ = tx.send(Ok(Some(chunk))).await;
+        let response = self.client.post(url, headers, request).await?;
+        match response.status() {
+            StatusCode::OK => {
+                // Create event stream
+                let mut event_stream = response.0.into_data_stream().eventsource();
+                // Spawn task to consume event stream and send messages to receiver
+                tokio::spawn(async move {
+                    while let Some(result) = event_stream.next().await {
+                        match result {
+                            Ok(event) if event.data == "[DONE]" => {
+                                // DONE message: send None to signal completion
+                                let _ = tx.send(Ok(None)).await;
+                                break;
+                            }
+                            // Attempt to deserialize to S
+                            Ok(event) => match serde_json::from_str::<S>(&event.data) {
+                                Ok(message) => {
+                                    let _ = tx.send(Ok(Some(message))).await;
+                                }
+                                Err(_serde_error) => {
+                                    // Failed to deserialize to S, attempt to deserialize to OpenAiErrorMessage
+                                    let error = match serde_json::from_str::<OpenAiErrorMessage>(
+                                        &event.data,
+                                    ) {
+                                        // Return error with code and message from downstream server
+                                        Ok(openai_error) => Error::Http {
+                                            code: StatusCode::from_u16(openai_error.error.code)
+                                                .unwrap(),
+                                            message: openai_error.error.message,
+                                        },
+                                        // Failed to deserialize to S and OpenAiErrorMessage
+                                        // Return internal server error
+                                        Err(serde_error) => Error::Http {
+                                            code: StatusCode::INTERNAL_SERVER_ERROR,
+                                            message: format!(
+                                                "deserialization error: {serde_error}"
+                                            ),
+                                        },
+                                    };
+                                    let _ = tx.send(Err(error.into())).await;
+                                }
+                            },
+                            Err(error) => {
+                                // Event stream error
+                                // Return internal server error
+                                let error = Error::Http {
+                                    code: StatusCode::INTERNAL_SERVER_ERROR,
+                                    message: error.to_string(),
+                                };
+                                let _ = tx.send(Err(error.into())).await;
+                            }
                         }
-                        Err(e) => {
-                            let error = Error::Http {
-                                code: StatusCode::INTERNAL_SERVER_ERROR,
-                                message: format!("deserialization error: {e}"),
-                            };
-                            let _ = tx.send(Err(error.into())).await;
-                        }
-                    },
-                    Err(error) => {
-                        // We received an error from the event stream, send error message
-                        let error = Error::Http {
-                            code: StatusCode::INTERNAL_SERVER_ERROR,
-                            message: error.to_string(),
-                        };
-                        let _ = tx.send(Err(error.into())).await;
                     }
-                }
+                });
+                Ok(rx)
             }
-        });
-        Ok(rx)
+            _ => {
+                // Return error with code and message from downstream server
+                let code = response.status();
+                let message = if let Ok(response) = response.json::<OpenAiError>().await {
+                    response.message
+                } else {
+                    "unknown error occurred".into()
+                };
+                Err(Error::Http { code, message })
+            }
+        }
     }
 }
 
@@ -220,6 +260,14 @@ impl From<Completion> for CompletionsResponse {
     fn from(value: Completion) -> Self {
         Self::Unary(Box::new(value))
     }
+}
+
+/// Tokenize response.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct TokenizeResponse {
+    pub count: u32,
+    pub max_model_len: u32,
+    pub tokens: Vec<u32>,
 }
 
 /// Chat completions request.
@@ -295,6 +343,13 @@ impl ChatCompletionsRequest {
 /// the downstream server implementation.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionsRequest {
+    /// Detector config.
+    #[serde(default, skip_serializing)]
+    pub detectors: DetectorConfig,
+    /// Prompt masks.
+    #[serde(rename = "_prompt_masks", skip_serializing)]
+    #[doc(hidden)]
+    pub prompt_masks: Option<Vec<(usize, usize)>>,
     /// Stream parameter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
@@ -312,9 +367,46 @@ impl CompletionsRequest {
         if self.model.is_empty() {
             return Err(ValidationError::Invalid("`model` must not be empty".into()));
         }
-        if self.prompt.is_empty() {
+        if !self.detectors.input.is_empty() && self.prompt.is_empty() {
             return Err(ValidationError::Invalid(
-                "`prompt` must not be empty".into(),
+                "`prompt` must not be empty when input detectors are provided".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Tokenize request.
+///
+/// Required when there are input detections.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenizeRequest {
+    /// Model name.
+    pub model: String,
+    /// Prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<Message>>,
+    /// Extra fields not captured above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl TokenizeRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.model.is_empty() {
+            return Err(ValidationError::Invalid("`model` must not be empty".into()));
+        }
+        if self.prompt.is_some() && self.messages.is_some() {
+            return Err(ValidationError::Invalid(
+                "`prompt` and `messages` cannot be used at the same time".into(),
+            ));
+        }
+        if self.prompt.is_none() && self.messages.is_none() {
+            return Err(ValidationError::Invalid(
+                "Either `prompt` or `messages` must be supplied".into(),
             ));
         }
         Ok(())
@@ -385,7 +477,7 @@ pub struct ToolChoiceObject {
     /// The type of the tool.
     #[serde(rename = "type")]
     pub r#type: String,
-    pub function: Function,
+    pub function: FunctionCall,
 }
 
 /// Stream options.
@@ -545,20 +637,26 @@ pub struct ImageUrl {
 /// Tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
+    /// Index
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
     /// The ID of the tool call.
-    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// The type of the tool.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
     /// The function that the model called.
-    pub function: Function,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCall>,
 }
 
-/// Function.
+/// Function call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Function {
+pub struct FunctionCall {
     /// The name of the function to call.
-    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The arguments to call the function with, as generated by the model in JSON format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
@@ -590,10 +688,18 @@ pub struct ChatCompletion {
     pub service_tier: Option<String>,
     /// Detections
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detections: Option<ChatDetections>,
+    pub detections: Option<CompletionDetections>,
     /// Warnings
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<OrchestratorWarning>,
+    pub warnings: Vec<CompletionDetectionWarning>,
+}
+
+/// Helper to accept both string and integer for stop_reason.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum StopReason {
+    String(String),
+    Integer(i64),
 }
 
 /// Chat completion choice.
@@ -608,7 +714,7 @@ pub struct ChatCompletionChoice {
     /// The reason the model stopped generating tokens.
     pub finish_reason: String,
     /// The stop string or token id that caused the completion.
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<StopReason>,
 }
 
 /// Chat completion message.
@@ -627,13 +733,14 @@ pub struct ChatCompletionMessage {
 }
 
 /// Chat completion logprobs.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChatCompletionLogprobs {
     /// A list of message content tokens with log probability information.
-    pub content: Option<Vec<ChatCompletionLogprob>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ChatCompletionLogprob>,
     /// A list of message refusal tokens with log probability information.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refusal: Option<Vec<ChatCompletionLogprob>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refusal: Vec<ChatCompletionLogprob>,
 }
 
 /// Chat completion logprob.
@@ -643,10 +750,9 @@ pub struct ChatCompletionLogprob {
     pub token: String,
     /// The log probability of this token.
     pub logprob: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A list of integers representing the UTF-8 bytes representation of the token.
     pub bytes: Option<Vec<u8>>,
     /// List of the most likely tokens and their log probability, at this token position.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<Vec<ChatCompletionTopLogprob>>,
 }
 
@@ -657,10 +763,12 @@ pub struct ChatCompletionTopLogprob {
     pub token: String,
     /// The log probability of this token.
     pub logprob: f32,
+    /// A list of integers representing the UTF-8 bytes representation of the token.
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Streaming chat completion chunk.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletionChunk {
     /// A unique identifier for the chat completion. Each chunk has the same ID.
     pub id: String,
@@ -683,14 +791,31 @@ pub struct ChatCompletionChunk {
     pub usage: Option<Usage>,
     /// Detections
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detections: Option<ChatDetections>,
+    pub detections: Option<CompletionDetections>,
     /// Warnings
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<OrchestratorWarning>,
+    pub warnings: Vec<CompletionDetectionWarning>,
+}
+
+impl Default for ChatCompletionChunk {
+    fn default() -> Self {
+        Self {
+            id: Default::default(),
+            object: "chat.completion.chunk".into(),
+            created: Default::default(),
+            model: Default::default(),
+            system_fingerprint: Default::default(),
+            choices: Default::default(),
+            service_tier: Default::default(),
+            usage: Default::default(),
+            detections: Default::default(),
+            warnings: Default::default(),
+        }
+    }
 }
 
 /// Streaming chat completion chunk choice.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletionChunkChoice {
     /// The index of the choice in the list of choices.
     pub index: u32,
@@ -701,11 +826,11 @@ pub struct ChatCompletionChunkChoice {
     /// The reason the model stopped generating tokens.
     pub finish_reason: Option<String>,
     /// The stop string or token id that caused the completion.
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<StopReason>,
 }
 
 /// Streaming chat completion delta.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletionDelta {
     /// The role of the author of this message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -739,6 +864,12 @@ pub struct Completion {
     /// This fingerprint represents the backend configuration that the model runs with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+    /// Detections
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detections: Option<CompletionDetections>,
+    /// Warnings
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<CompletionDetectionWarning>,
 }
 
 /// Completion (legacy) choice.
@@ -753,14 +884,14 @@ pub struct CompletionChoice {
     /// The reason the model stopped generating tokens.
     pub finish_reason: Option<String>,
     /// The stop string or token id that caused the completion.
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<StopReason>,
     /// Prompt logprobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_logprobs: Option<Vec<Option<HashMap<String, Logprob>>>>,
 }
 
 /// Completion logprobs.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct CompletionLogprobs {
     /// Tokens generated by the model.
     pub tokens: Vec<String>,
@@ -833,39 +964,45 @@ pub struct OpenAiError {
     pub code: u16,
 }
 
-/// Guardrails chat detections.
+/// OpenAI streaming error message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiErrorMessage {
+    pub error: OpenAiError,
+}
+
+/// Guardrails completion detections.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ChatDetections {
+pub struct CompletionDetections {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub input: Vec<InputDetectionResult>,
+    pub input: Vec<CompletionInputDetections>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub output: Vec<OutputDetectionResult>,
+    pub output: Vec<CompletionOutputDetections>,
 }
 
-/// Guardrails chat input detections.
+/// Guardrails completion input detections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct InputDetectionResult {
+pub struct CompletionInputDetections {
     pub message_index: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub results: Vec<ContentAnalysisResponse>,
 }
 
-/// Guardrails chat output detections.
+/// Guardrails completion output detections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OutputDetectionResult {
+pub struct CompletionOutputDetections {
     pub choice_index: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub results: Vec<ContentAnalysisResponse>,
 }
 
-/// Guardrails warning.
+/// Guardrails completion detection warning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OrchestratorWarning {
+pub struct CompletionDetectionWarning {
     r#type: DetectionWarningReason,
     message: String,
 }
 
-impl OrchestratorWarning {
+impl CompletionDetectionWarning {
     pub fn new(warning_type: DetectionWarningReason, message: &str) -> Self {
         Self {
             r#type: warning_type,
@@ -982,5 +1119,58 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// Test deserialization of stop_reason as integer
+    #[test]
+    fn test_chat_completion_choice_stop_reason_integer() {
+        use serde_json::json;
+
+        use crate::clients::openai::{ChatCompletionChoice, StopReason};
+
+        let json_choice = json!({
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello!",
+                "tool_calls": [],
+                "refusal": null
+            },
+            "logprobs": null,
+            "finish_reason": "EOS_TOKEN",
+            "stop_reason": 32007
+        });
+
+        let choice: ChatCompletionChoice = serde_json::from_value(json_choice)
+            .expect("Should deserialize with integer stop_reason");
+        assert_eq!(choice.stop_reason, Some(StopReason::Integer(32007)));
+    }
+
+    /// Test deserialization of stop_reason as string
+    #[test]
+    fn test_chat_completion_choice_stop_reason_string() {
+        use serde_json::json;
+
+        use crate::clients::openai::{ChatCompletionChoice, StopReason};
+
+        let json_choice = json!({
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello!",
+                "tool_calls": [],
+                "refusal": null
+            },
+            "logprobs": null,
+            "finish_reason": "EOS_TOKEN",
+            "stop_reason": "32007"
+        });
+
+        let choice: ChatCompletionChoice = serde_json::from_value(json_choice)
+            .expect("Should deserialize with string stop_reason");
+        assert_eq!(
+            choice.stop_reason,
+            Some(StopReason::String("32007".to_string()))
+        );
     }
 }

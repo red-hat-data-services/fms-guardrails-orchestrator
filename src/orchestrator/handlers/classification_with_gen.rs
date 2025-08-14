@@ -51,16 +51,8 @@ impl Handle<ClassificationWithGenTask> for Orchestrator {
         let input_detectors = task.guardrails_config.input_detectors();
         let output_detectors = task.guardrails_config.output_detectors();
 
-        // input detectors validation
         validate_detectors(
-            &input_detectors,
-            &ctx.config.detectors,
-            &[DetectorType::TextContents],
-            true,
-        )?;
-        // output detectors validation
-        validate_detectors(
-            &output_detectors,
+            input_detectors.iter().chain(output_detectors.iter()),
             &ctx.config.detectors,
             &[DetectorType::TextContents],
             true,
@@ -83,10 +75,7 @@ impl Handle<ClassificationWithGenTask> for Orchestrator {
         }
 
         // Handle generation
-        let client = ctx
-            .clients
-            .get_as::<GenerationClient>("generation")
-            .unwrap();
+        let client = ctx.clients.get::<GenerationClient>("generation").unwrap();
         let generation = common::generate(
             client,
             task.headers.clone(),
@@ -132,10 +121,7 @@ async fn handle_input_detection(
     };
     if !detections.is_empty() {
         // Get token count
-        let client = ctx
-            .clients
-            .get_as::<GenerationClient>("generation")
-            .unwrap();
+        let client = ctx.clients.get::<GenerationClient>("generation").unwrap();
         let input_token_count = match common::tokenize(
             client,
             task.headers.clone(),

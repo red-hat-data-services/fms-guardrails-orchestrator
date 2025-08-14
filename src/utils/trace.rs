@@ -17,18 +17,18 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::{extract::Request, http::HeaderMap, response::Response};
 use opentelemetry::{
-    KeyValue, global,
-    trace::{TraceContextExt, TraceError, TraceId, TracerProvider},
+    global,
+    trace::{TraceContextExt, TraceId, TracerProvider},
 };
 use opentelemetry_http::{HeaderExtractor, HeaderInjector};
-use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
-    metrics::{MetricError, PeriodicReader, SdkMeterProvider},
+    metrics::{PeriodicReader, SdkMeterProvider},
     propagation::TraceContextPropagator,
-    runtime,
     trace::Sampler,
 };
 use tracing::{Span, error, info, info_span};
@@ -40,26 +40,20 @@ use crate::{
     clients::http::TracedResponse,
 };
 
-#[derive(Debug, thiserror::Error)]
-pub enum TracingError {
-    #[error("Error from tracing provider: {0}")]
-    TraceError(#[from] TraceError),
-    #[error("Error from metrics provider: {0}")]
-    MetricError(#[from] MetricError),
-}
+pub const DEFAULT_GRPC_OTLP_ENDPOINT: &str = "http://localhost:4317";
+pub const DEFAULT_HTTP_OTLP_ENDPOINT: &str = "http://localhost:4318";
 
 fn resource(tracing_config: TracingConfig) -> Resource {
-    Resource::new(vec![KeyValue::new(
-        "service.name",
-        tracing_config.service_name,
-    )])
+    Resource::builder()
+        .with_service_name(tracing_config.service_name)
+        .build()
 }
 
 /// Initializes an OpenTelemetry tracer provider with an OTLP export pipeline based on the
 /// provided config.
 fn init_tracer_provider(
     tracing_config: TracingConfig,
-) -> Result<Option<opentelemetry_sdk::trace::TracerProvider>, TracingError> {
+) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>, anyhow::Error> {
     if let Some((protocol, endpoint)) = tracing_config.clone().traces {
         let timeout = Duration::from_secs(3);
         let exporter = match protocol {
@@ -67,17 +61,18 @@ fn init_tracer_provider(
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
-                .build()?,
+                .build()
+                .context("Failed to build gRPC span exporter")?,
             OtlpProtocol::Http => SpanExporter::builder()
                 .with_http()
-                .with_http_client(reqwest::Client::new())
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
-                .build()?,
+                .build()
+                .context("Failed to build HTTP span exporter")?,
         };
         Ok(Some(
-            opentelemetry_sdk::trace::TracerProvider::builder()
-                .with_batch_exporter(exporter, runtime::Tokio)
+            opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
                 .with_resource(resource(tracing_config))
                 .with_sampler(Sampler::AlwaysOn)
                 .build(),
@@ -86,7 +81,7 @@ fn init_tracer_provider(
         // We still need a tracing provider as long as we are logging in order to enable any
         // trace-sensitive logs, such as any mentions of a request's trace_id.
         Ok(Some(
-            opentelemetry_sdk::trace::TracerProvider::builder()
+            opentelemetry_sdk::trace::SdkTracerProvider::builder()
                 .with_resource(resource(tracing_config))
                 .with_sampler(Sampler::AlwaysOn)
                 .build(),
@@ -100,7 +95,7 @@ fn init_tracer_provider(
 /// provided config.
 fn init_meter_provider(
     tracing_config: TracingConfig,
-) -> Result<Option<SdkMeterProvider>, TracingError> {
+) -> Result<Option<SdkMeterProvider>, anyhow::Error> {
     if let Some((protocol, endpoint)) = tracing_config.clone().metrics {
         // Note: DefaultAggregationSelector removed from OpenTelemetry SDK as of 0.26.0
         // as custom aggregation should be available in Views. Cumulative temporality is default.
@@ -110,15 +105,16 @@ fn init_meter_provider(
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
-                .build()?,
+                .build()
+                .context("Failed to build OTel gRPC metric exporter")?,
             OtlpProtocol::Http => MetricExporter::builder()
                 .with_http()
-                .with_http_client(reqwest::Client::new())
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
-                .build()?,
+                .build()
+                .context("Failed to build OTel HTTP metric exporter")?,
         };
-        let reader = PeriodicReader::builder(exporter, runtime::Tokio)
+        let reader = PeriodicReader::builder(exporter)
             .with_interval(Duration::from_secs(3))
             .build();
         Ok(Some(
@@ -136,7 +132,7 @@ fn init_meter_provider(
 /// crate. What telemetry is exported and to where is determined based on the provided config
 pub fn init_tracing(
     tracing_config: TracingConfig,
-) -> Result<impl FnOnce() -> Result<(), TracingError>, TracingError> {
+) -> Result<impl FnOnce() -> Result<(), anyhow::Error>, anyhow::Error> {
     let mut layers = Vec::new();
     global::set_text_map_propagator(TraceContextPropagator::new());
 
@@ -153,7 +149,8 @@ pub fn init_tracing(
         .add_directive("reqwest=error".parse().unwrap());
 
     // Set up tracing layer with OTLP exporter
-    let trace_provider = init_tracer_provider(tracing_config.clone())?;
+    let trace_provider = init_tracer_provider(tracing_config.clone())
+        .context("Failed to initialize tracer provider")?;
     if let Some(tracer_provider) = trace_provider.clone() {
         global::set_tracer_provider(tracer_provider.clone());
         layers.push(
@@ -164,7 +161,8 @@ pub fn init_tracing(
     }
 
     // Set up metrics layer with OTLP exporter
-    let meter_provider = init_meter_provider(tracing_config.clone())?;
+    let meter_provider = init_meter_provider(tracing_config.clone())
+        .context("Failed to initialize meter provider")?;
     if let Some(meter_provider) = meter_provider.clone() {
         global::set_meter_provider(meter_provider.clone());
         layers.push(MetricsLayer::new(meter_provider).boxed());
@@ -190,39 +188,33 @@ pub fn init_tracing(
     let subscriber = tracing_subscriber::registry().with(filter).with(layers);
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    if let Some(traces) = tracing_config.traces {
-        info!(
-            "OTLP tracing enabled: Exporting {} to {}",
-            traces.0, traces.1
-        );
+    if let Some((protocol, endpoint)) = tracing_config.traces {
+        info!(%protocol, %endpoint, "OTLP traces enabled");
     } else {
-        info!("OTLP traces export disabled")
+        info!("OTLP traces disabled")
     }
-
-    if let Some(metrics) = tracing_config.metrics {
-        info!(
-            "OTLP metrics enabled: Exporting {} to {}",
-            metrics.0, metrics.1
-        );
+    if let Some((protocol, endpoint)) = tracing_config.metrics {
+        info!(%protocol, %endpoint, "OTLP metrics enabled");
     } else {
-        info!("OTLP metrics export disabled")
+        info!("OTLP metrics disabled")
     }
 
     if !tracing_config.quiet {
-        info!(
-            "Stdout logging enabled with format {}",
-            tracing_config.log_format
-        );
+        info!(format = %tracing_config.log_format, "stdout logging enabled");
     } else {
-        info!("Stdout logging disabled"); // This will only be visible in traces
+        info!("stdout logging disabled"); // This will only be visible in traces
     }
 
     Ok(move || {
-        global::shutdown_tracer_provider();
+        if let Some(trace_provider) = trace_provider {
+            trace_provider
+                .shutdown()
+                .context("Failed to shutdown tracer provider")?;
+        }
         if let Some(meter_provider) = meter_provider {
             meter_provider
                 .shutdown()
-                .map_err(TracingError::MetricError)?;
+                .context("Failed to shutdown meter provider")?;
         }
         Ok(())
     })

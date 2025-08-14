@@ -23,15 +23,14 @@ use tracing::{debug, instrument};
 
 use crate::{
     clients::{
-        GenerationClient, TextContentsDetectorClient,
+        DetectorClient, GenerationClient,
         chunker::ChunkerClient,
         detector::{
             ChatDetectionRequest, ContentAnalysisRequest, ContextDocsDetectionRequest, ContextType,
-            GenerationDetectionRequest, TextChatDetectorClient, TextContextDocDetectorClient,
-            TextGenerationDetectorClient,
+            GenerationDetectionRequest,
         },
         http::JSON_CONTENT_TYPE,
-        openai::{self, OpenAiClient},
+        openai::{self, OpenAiClient, TokenizeRequest},
     },
     models::{
         ClassifiedGeneratedTextResult as GenerateResponse, DetectorParams,
@@ -99,7 +98,7 @@ pub async fn chunk_stream(
 /// Sends request to text contents detector client.
 #[instrument(skip_all, fields(detector_id))]
 pub async fn detect_text_contents(
-    client: &TextContentsDetectorClient,
+    client: &DetectorClient,
     headers: HeaderMap,
     detector_id: DetectorId,
     params: DetectorParams,
@@ -149,7 +148,7 @@ pub async fn detect_text_contents(
 /// Sends request to text generation detector client.
 #[instrument(skip_all, fields(detector_id))]
 pub async fn detect_text_generation(
-    client: &TextGenerationDetectorClient,
+    client: &DetectorClient,
     headers: HeaderMap,
     detector_id: DetectorId,
     params: DetectorParams,
@@ -181,7 +180,7 @@ pub async fn detect_text_generation(
 /// Sends request to text chat detector client.
 #[instrument(skip_all, fields(detector_id))]
 pub async fn detect_text_chat(
-    client: &TextChatDetectorClient,
+    client: &DetectorClient,
     headers: HeaderMap,
     detector_id: DetectorId,
     params: DetectorParams,
@@ -213,7 +212,7 @@ pub async fn detect_text_chat(
 /// Sends request to text context detector client.
 #[instrument(skip_all, fields(detector_id))]
 pub async fn detect_text_context(
-    client: &TextContextDocDetectorClient,
+    client: &DetectorClient,
     headers: HeaderMap,
     detector_id: DetectorId,
     params: DetectorParams,
@@ -335,6 +334,27 @@ pub async fn completion_stream(
     .enumerate()
     .boxed();
     Ok(stream)
+}
+
+/// Sends tokenize request to OpenAI client.
+#[instrument(skip_all, fields(model_id))]
+pub async fn tokenize_openai(
+    client: &OpenAiClient,
+    mut headers: HeaderMap,
+    request: TokenizeRequest,
+) -> Result<openai::TokenizeResponse, Error> {
+    let model_id = request.model.clone();
+    debug!(%model_id, ?request, "sending tokenize request");
+    headers.append(CONTENT_TYPE, JSON_CONTENT_TYPE);
+    let response = client.tokenize(request, headers).await.map_err(|error| {
+        tracing::error!("Tokenize request failed: {error}");
+        Error::TokenizeRequestFailed {
+            id: model_id.clone(),
+            error,
+        }
+    })?;
+    debug!(%model_id, ?response, "received tokenize response");
+    Ok(response)
 }
 
 /// Sends tokenize request to generation client.

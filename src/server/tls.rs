@@ -20,11 +20,11 @@ use axum::{Router, extract::Request};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::{debug, error, info, warn};
-use webpki::types::{CertificateDer, PrivateKeyDer};
 
 /// Loads certificates and configures TLS.
 pub fn configure_tls(
@@ -43,14 +43,12 @@ pub fn configure_tls(
             for client_cert in client_certs {
                 client_auth_certs
                     .add(client_cert.clone())
-                    .unwrap_or_else(|e| {
-                        panic!("error adding client cert {:?}: {}", client_cert, e)
-                    });
+                    .unwrap_or_else(|e| panic!("error adding client cert {client_cert:?}: {e}"));
             }
             info!("mTLS enabled");
             WebPkiClientVerifier::builder(client_auth_certs.into())
                 .build()
-                .unwrap_or_else(|e| panic!("error building client verifier: {}", e))
+                .unwrap_or_else(|e| panic!("error building client verifier: {e}"))
         } else {
             info!("TLS enabled");
             WebPkiClientVerifier::no_client_auth()
@@ -165,8 +163,5 @@ fn load_private_key(filename: &PathBuf) -> PrivateKeyDer<'static> {
             _ => {}
         }
     }
-    panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
-        filename
-    );
+    panic!("no keys found in {filename:?} (encrypted keys not supported)");
 }
