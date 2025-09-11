@@ -33,8 +33,8 @@ use crate::{
         Context, Error,
         common::{self, text_contents_detections, validate_detectors},
         types::{
-            Chunk, CompletionBatcher, CompletionState, CompletionStream, DetectionBatchStream,
-            Detections,
+            Chunk, CompletionBatcher, CompletionState, CompletionStream, Detection,
+            DetectionBatchStream,
         },
     },
 };
@@ -182,7 +182,7 @@ async fn handle_input_detection(
             detections: Some(CompletionDetections {
                 input: vec![CompletionInputDetections {
                     message_index: 0,
-                    results: detections.into(),
+                    results: detections,
                 }],
                 ..Default::default()
             }),
@@ -339,15 +339,14 @@ async fn process_completion_stream(
                 // Send completion chunk to response channel
                 // NOTE: this forwards completion chunks without detections and is only
                 // done here for 2 cases: a) no output detectors b) only whole doc output detectors
-                if let Some(response_tx) = &response_tx {
-                    if response_tx
+                if let Some(response_tx) = &response_tx
+                    && response_tx
                         .send(Ok(Some(completion.clone())))
                         .await
                         .is_err()
-                    {
-                        info!(%trace_id, "task completed: client disconnected");
-                        return;
-                    }
+                {
+                    info!(%trace_id, "task completed: client disconnected");
+                    return;
                 }
                 if let Some(usage) = &completion.usage
                     && completion.choices.is_empty()
@@ -384,10 +383,9 @@ async fn process_completion_stream(
                         // Send choice text to detection input channel
                         if let Some(input_tx) =
                             input_txs.as_ref().and_then(|txs| txs.get(&choice.index))
+                            && !choice_text.is_empty()
                         {
-                            if !choice_text.is_empty() {
-                                let _ = input_tx.send(Ok((message_index, choice_text))).await;
-                            }
+                            let _ = input_tx.send(Ok((message_index, choice_text))).await;
                         }
                     } else {
                         debug!(%trace_id, %message_index, ?completion, "completion chunk contains no choice");
@@ -459,7 +457,7 @@ async fn handle_whole_doc_output_detection(
         .into_iter()
         .map(|(choice_index, detections)| CompletionOutputDetections {
             choice_index,
-            results: detections.into(),
+            results: detections,
         })
         .collect::<Vec<_>>();
     // Build warnings
@@ -483,7 +481,7 @@ fn output_detection_response(
     completion_state: &Arc<CompletionState<Completion>>,
     choice_index: u32,
     chunk: Chunk,
-    detections: Detections,
+    detections: Vec<Detection>,
 ) -> Result<Completion, Error> {
     // Get completions for this choice index
     let completions = completion_state.completions.get(&choice_index).unwrap();
@@ -511,7 +509,7 @@ fn output_detection_response(
         completion.detections = Some(CompletionDetections {
             output: vec![CompletionOutputDetections {
                 choice_index,
-                results: detections.into(),
+                results: detections,
             }],
             ..Default::default()
         });
@@ -531,19 +529,19 @@ fn output_detection_response(
 fn merge_logprobs(completions: &[Completion]) -> Option<CompletionLogprobs> {
     let mut merged_logprobs = CompletionLogprobs::default();
     for completion in completions {
-        if let Some(choice) = completion.choices.first() {
-            if let Some(logprobs) = &choice.logprobs {
-                merged_logprobs.tokens.extend_from_slice(&logprobs.tokens);
-                merged_logprobs
-                    .token_logprobs
-                    .extend_from_slice(&logprobs.token_logprobs);
-                merged_logprobs
-                    .top_logprobs
-                    .extend_from_slice(&logprobs.top_logprobs);
-                merged_logprobs
-                    .text_offset
-                    .extend_from_slice(&logprobs.text_offset);
-            }
+        if let Some(choice) = completion.choices.first()
+            && let Some(logprobs) = &choice.logprobs
+        {
+            merged_logprobs.tokens.extend_from_slice(&logprobs.tokens);
+            merged_logprobs
+                .token_logprobs
+                .extend_from_slice(&logprobs.token_logprobs);
+            merged_logprobs
+                .top_logprobs
+                .extend_from_slice(&logprobs.top_logprobs);
+            merged_logprobs
+                .text_offset
+                .extend_from_slice(&logprobs.text_offset);
         }
     }
     (!merged_logprobs.tokens.is_empty()
@@ -563,7 +561,6 @@ async fn process_detection_batch_stream(
     while let Some(result) = detection_batch_stream.next().await {
         match result {
             Ok((choice_index, chunk, detections)) => {
-                let input_end_index = chunk.input_end_index;
                 match output_detection_response(&completion_state, choice_index, chunk, detections)
                 {
                     Ok(completion) => {
@@ -572,20 +569,6 @@ async fn process_detection_batch_stream(
                         if response_tx.send(Ok(Some(completion))).await.is_err() {
                             info!(%trace_id, "task completed: client disconnected");
                             return;
-                        }
-                        // If this is the final completion chunk with content, send completion chunk with finish reason
-                        let completions = completion_state.completions.get(&choice_index).unwrap();
-                        if completions.keys().rev().nth(1) == Some(&input_end_index) {
-                            if let Some((_, completion)) = completions.last_key_value() {
-                                if completion
-                                    .choices
-                                    .first()
-                                    .is_some_and(|choice| choice.finish_reason.is_some())
-                                {
-                                    debug!(%trace_id, %choice_index, ?completion, "sending completion chunk with finish reason to response channel");
-                                    let _ = response_tx.send(Ok(Some(completion.clone()))).await;
-                                }
-                            }
                         }
                     }
                     Err(error) => {

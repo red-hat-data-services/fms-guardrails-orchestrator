@@ -23,10 +23,7 @@ use std::{
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    clients::{chunker::DEFAULT_CHUNKER_ID, is_valid_hostname},
-    utils::one_or_many,
-};
+use crate::clients::{chunker::DEFAULT_CHUNKER_ID, is_valid_hostname};
 
 /// Default allowed headers to passthrough to clients.
 const DEFAULT_ALLOWED_HEADERS: &[&str] = &[];
@@ -85,6 +82,10 @@ pub struct ServiceConfig {
     pub resolution_strategy_timeout: Option<u64>,
     /// Max retries for client calls [currently only for grpc generation]
     pub max_retries: Option<usize>,
+    /// HTTP2 keep-alive interval in seconds for client calls [currently only for grpc generation]
+    pub http2_keep_alive_interval: Option<u64>,
+    /// Keep-alive timeout in seconds for client calls [currently only for grpc generation]
+    pub keep_alive_timeout: Option<u64>,
 }
 
 impl ServiceConfig {
@@ -98,6 +99,8 @@ impl ServiceConfig {
             resolution_strategy: None,
             resolution_strategy_timeout: None,
             max_retries: None,
+            http2_keep_alive_interval: None,
+            keep_alive_timeout: None,
         }
     }
 }
@@ -177,8 +180,8 @@ pub struct DetectorConfig {
     /// Default threshold with which to filter detector results by score
     pub default_threshold: f64,
     /// Type of detection this detector performs
-    #[serde(rename = "type", deserialize_with = "one_or_many")]
-    pub r#type: Vec<DetectorType>,
+    #[serde(rename = "type")]
+    pub r#type: DetectorType,
 }
 
 #[derive(Default, Clone, Debug, Deserialize, PartialEq)]
@@ -211,6 +214,9 @@ pub struct OrchestratorConfig {
     // List of header keys allowed to be passed to downstream servers
     #[serde(default)]
     pub passthrough_headers: HashSet<String>,
+    // rewrite X-Forwarded-Access-Tokens into Bearer tokens
+    #[serde(default)]
+    pub rewrite_forwarded_access_header: bool,
     /// Number of detector requests to send concurrently for a task.
     #[serde(default = "default_detector_concurrent_requests")]
     pub detector_concurrent_requests: usize,
@@ -416,6 +422,7 @@ impl Default for OrchestratorConfig {
             detectors: HashMap::default(),
             tls: None,
             passthrough_headers: HashSet::default(),
+            rewrite_forwarded_access_header: false,
             detector_concurrent_requests: default_detector_concurrent_requests(),
             chunker_concurrent_requests: default_chunker_concurrent_requests(),
         }
