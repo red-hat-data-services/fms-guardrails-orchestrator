@@ -29,14 +29,13 @@ use url::Url;
 
 use super::{
     Client, Error, HttpClient, create_http_client,
-    detector::ContentAnalysisResponse,
     http::{HttpClientExt, RequestBody},
 };
 use crate::{
     config::ServiceConfig,
     health::HealthCheckResult,
     models::{DetectionWarningReason, DetectorParams, ValidationError},
-    orchestrator,
+    orchestrator::{self, types::Detection},
 };
 
 const DEFAULT_PORT: u16 = 8080;
@@ -221,11 +220,11 @@ impl Client for OpenAiClient {
         "openai"
     }
 
-    async fn health(&self) -> HealthCheckResult {
+    async fn health(&self, headers: HeaderMap) -> HealthCheckResult {
         if let Some(health_client) = &self.health_client {
-            health_client.health().await
+            health_client.health(headers).await
         } else {
-            self.client.health().await
+            self.client.health(headers).await
         }
     }
 }
@@ -847,7 +846,7 @@ pub struct ChatCompletionDelta {
 }
 
 /// Completion (legacy) response. Also used for streaming.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Completion {
     /// A unique identifier for the completion.
     pub id: String,
@@ -872,8 +871,24 @@ pub struct Completion {
     pub warnings: Vec<CompletionDetectionWarning>,
 }
 
+impl Default for Completion {
+    fn default() -> Self {
+        Self {
+            id: Default::default(),
+            object: "text_completion".into(), // This value is constant: https://platform.openai.com/docs/api-reference/completions/object#completions/object-object
+            created: Default::default(),
+            model: Default::default(),
+            choices: Default::default(),
+            usage: Default::default(),
+            system_fingerprint: Default::default(),
+            detections: Default::default(),
+            warnings: Default::default(),
+        }
+    }
+}
+
 /// Completion (legacy) choice.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CompletionChoice {
     /// The index of the choice in the list of choices.
     pub index: u32,
@@ -984,7 +999,7 @@ pub struct CompletionDetections {
 pub struct CompletionInputDetections {
     pub message_index: u32,
     #[serde(default)]
-    pub results: Vec<ContentAnalysisResponse>,
+    pub results: Vec<Detection>,
 }
 
 /// Guardrails completion output detections.
@@ -992,7 +1007,7 @@ pub struct CompletionInputDetections {
 pub struct CompletionOutputDetections {
     pub choice_index: u32,
     #[serde(default)]
-    pub results: Vec<ContentAnalysisResponse>,
+    pub results: Vec<Detection>,
 }
 
 /// Guardrails completion detection warning.
