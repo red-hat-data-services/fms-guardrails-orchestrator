@@ -73,7 +73,7 @@ tokio = { version = "1.46.1", features = [
 ] }
 tokio-rustls = { version = "0.26.2", features = ["ring"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tonic = { version = "0.13.1", features = [
+tonic = { version = "0.14.0", features = [
     "tls-ring",
     "tls-native-roots",
     "tls-webpki-roots",
@@ -87,7 +87,7 @@ url = "2.5.4"
 uuid = { version = "1.17.0", features = ["v4"] }
 
 [build-dependencies]
-tonic-build = "0.13.1"
+tonic-build = "0.14.0"
 
 [dev-dependencies]
 axum-test = "17.3.0"
