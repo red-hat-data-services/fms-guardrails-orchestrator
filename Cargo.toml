@@ -61,7 +61,7 @@ uuid = { version = "1.12.1", features = ["v4"] }
 tonic-build = "0.12.3"
 
 [dev-dependencies]
-axum-test = "17.1.0"
+axum-test = "18.0.0"
 faux = "0.1.12"
 tracing-test = "0.2.5"
 
