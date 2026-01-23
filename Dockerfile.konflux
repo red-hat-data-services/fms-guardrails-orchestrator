@@ -3,20 +3,22 @@ ARG UBI_BASE_IMAGE_TAG=latest
 ARG PROTOC_VERSION=29.3
 ARG CONFIG_FILE=config/config.yaml
 ARG TARGETARCH
+ARG OPENSSL_VERSION=3.5.1-5.el9_7
 
 ## Rust builder ################################################################
 FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS rust-builder
 ARG PROTOC_VERSION
 ARG TARGETARCH
+ARG OPENSSL_VERSION
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 # Install dependencies
-RUN microdnf --disableplugin=subscription-manager -y update && \
-    microdnf install --disableplugin=subscription-manager -y \
+RUN microdnf install --disableplugin=subscription-manager -y \
         unzip \
         ca-certificates \
-        openssl-devel \
+        openssl-libs-${OPENSSL_VERSION} \
+        openssl-devel-${OPENSSL_VERSION} \
         gcc && \
     microdnf clean all
 
@@ -38,11 +40,9 @@ RUN cd /tmp && \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         curl -L -O https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip; \
     elif [ "$TARGETARCH" = "s390x" ]; then \
-        microdnf update -y && \
         microdnf install -y cmake clang clang-devel && \
         curl -L -O https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-s390_64.zip; \
     elif [ "$TARGETARCH" = "ppc64le" ]; then \
-        microdnf update && \
         microdnf install -y cmake clang && \
         curl -L -O https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-ppcle_64.zip; \
     else \
@@ -82,17 +82,18 @@ RUN cargo test
 FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS fms-guardrails-orchestr8-release
 ARG CONFIG_FILE=config/config.yaml
 ARG TARGETARCH
+ARG OPENSSL_VERSION
 
 COPY --from=fms-guardrails-orchestr8-builder /app/target/release/fms-guardrails-orchestr8 /app/bin/
 COPY ${CONFIG_FILE} /app/config/config.yaml
 
 # Install packages based on target architecture
-RUN microdnf install -y --disableplugin=subscription-manager shadow-utils && \
+RUN microdnf install -y --disableplugin=subscription-manager shadow-utils openssl-libs-${OPENSSL_VERSION} && \
     if [ "$TARGETARCH" = "amd64" ]; then \
         microdnf install -y --disableplugin=subscription-manager compat-openssl11 || \
-        microdnf install -y --disableplugin=subscription-manager openssl; \
+        microdnf install -y --disableplugin=subscription-manager openssl-${OPENSSL_VERSION}; \
     else \
-        microdnf install -y --disableplugin=subscription-manager openssl; \
+        microdnf install -y --disableplugin=subscription-manager openssl-${OPENSSL_VERSION}; \
     fi && \
     microdnf clean all --disableplugin=subscription-manager
 
