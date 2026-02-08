@@ -92,7 +92,7 @@ tonic-build = "0.13.1"
 [dev-dependencies]
 axum-test = "17.3.0"
 mocktail = "0.3.0"
-rand = "0.9.2"
+rand = "0.10.0"
 test-log = "0.2.18"
 
 [profile.release]
