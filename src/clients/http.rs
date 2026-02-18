@@ -119,15 +119,22 @@ pub trait HttpClientExt: Client {
 pub struct HttpClient {
     base_url: Url,
     health_url: Url,
+    api_token: Option<String>,
     inner: HttpClientInner,
 }
 
 impl HttpClient {
-    pub fn new(base_url: Url, inner: HttpClientInner) -> Self {
+    pub fn new(base_url: Url, api_token: Option<String>, inner: HttpClientInner) -> Self {
+        // Ensure base_url has trailing slash for proper path joining
+        let mut base_url = base_url;
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
         let health_url = base_url.join("health").unwrap();
         Self {
             base_url,
             health_url,
+            api_token,
             inner,
         }
     }
@@ -137,9 +144,23 @@ impl HttpClient {
     }
 
     pub fn endpoint(&self, path: &str) -> Url {
+        let path = path.trim_start_matches('/');
         self.base_url.join(path).unwrap()
     }
 
+    /// Injects the API token as a Bearer token in the Authorization header if configured and present in the environment.
+    fn inject_api_token(&self, headers: &mut HeaderMap) -> Result<(), Error> {
+        if let Some(token) = &self.api_token {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| Error::Http {
+                    code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("invalid authorization header: {e}"),
+                })?,
+            );
+        }
+        Ok(())
+    }
     pub async fn get(
         &self,
         url: Url,
@@ -162,11 +183,14 @@ impl HttpClient {
         &self,
         url: Url,
         method: Method,
-        headers: HeaderMap,
+        mut headers: HeaderMap,
         body: impl RequestBody,
     ) -> Result<Response, Error> {
         let ctx = Span::current().context();
+
+        self.inject_api_token(&mut headers)?;
         let headers = trace::with_traceparent_header(&ctx, headers);
+
         let mut builder = hyper::http::request::Builder::new()
             .method(method)
             .uri(url.as_uri());
@@ -205,8 +229,6 @@ impl HttpClient {
                             message: format!("client request timeout: {e}"),
                         }),
                 }?;
-                let span = Span::current();
-                trace::trace_context_from_http_response(&span, &response);
                 Ok(response.into())
             }
             None => Err(builder.body(body).err().map_or_else(
