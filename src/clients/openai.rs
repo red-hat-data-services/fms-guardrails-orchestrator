@@ -123,8 +123,8 @@ impl OpenAiClient {
             _ => {
                 // Return error with code and message from downstream server
                 let code = response.status();
-                let message = if let Ok(response) = response.json::<OpenAiError>().await {
-                    response.message
+                let message = if let Ok(response) = response.json::<ErrorResponse>().await {
+                    response.message().into()
                 } else {
                     "unknown error occurred".into()
                 };
@@ -164,25 +164,20 @@ impl OpenAiClient {
                                     let _ = tx.send(Ok(Some(message))).await;
                                 }
                                 Err(_serde_error) => {
-                                    // Failed to deserialize to S, attempt to deserialize to OpenAiErrorMessage
-                                    let error = match serde_json::from_str::<OpenAiErrorMessage>(
-                                        &event.data,
-                                    ) {
-                                        // Return error with code and message from downstream server
-                                        Ok(openai_error) => Error::Http {
-                                            code: StatusCode::from_u16(openai_error.error.code)
-                                                .unwrap(),
-                                            message: openai_error.error.message,
-                                        },
-                                        // Failed to deserialize to S and OpenAiErrorMessage
-                                        // Return internal server error
-                                        Err(serde_error) => Error::Http {
-                                            code: StatusCode::INTERNAL_SERVER_ERROR,
-                                            message: format!(
-                                                "deserialization error: {serde_error}"
-                                            ),
-                                        },
-                                    };
+                                    // Failed to deserialize to S, attempt to deserialize to ErrorResponse.
+                                    let error =
+                                        match serde_json::from_str::<ErrorResponse>(&event.data) {
+                                            // Return error with code and message from downstream server
+                                            Ok(response) => response.into(),
+                                            // Failed to deserialize to S and ErrorResponse
+                                            // Return internal server error
+                                            Err(serde_error) => Error::Http {
+                                                code: StatusCode::INTERNAL_SERVER_ERROR,
+                                                message: format!(
+                                                    "deserialization error: {serde_error}"
+                                                ),
+                                            },
+                                        };
                                     let _ = tx.send(Err(error.into())).await;
                                 }
                             },
@@ -203,8 +198,8 @@ impl OpenAiClient {
             _ => {
                 // Return error with code and message from downstream server
                 let code = response.status();
-                let message = if let Ok(response) = response.json::<OpenAiError>().await {
-                    response.message
+                let message = if let Ok(response) = response.json::<ErrorResponse>().await {
+                    response.message().into()
                 } else {
                     "unknown error occurred".into()
                 };
@@ -291,6 +286,9 @@ pub struct ChatCompletionsRequest {
     pub model: String,
     /// Messages.
     pub messages: Vec<Message>,
+    /// A list of tools that the model may call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
     /// Extra fields not captured above.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -318,7 +316,12 @@ impl ChatCompletionsRequest {
 
             // As text_content detections only run on last message at the moment, only the last
             // message is being validated.
-            if self.messages.last().unwrap().is_text_content_empty() {
+            if let Some(message) = self.messages.last()
+                && message
+                    .content
+                    .as_ref()
+                    .is_none_or(|content| content.is_empty())
+            {
                 return Err(ValidationError::Invalid(
                     "if input detectors are provided, `content` must not be empty on last message"
                         .into(),
@@ -433,17 +436,82 @@ pub struct ResponseFormat {
 }
 
 /// Tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tool {
-    /// The type of the tool.
-    #[serde(rename = "type")]
-    pub r#type: String,
-    pub function: ToolFunction,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Tool {
+    Function(FunctionTool),
+    Custom(CustomTool),
 }
 
-/// Tool function.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolFunction {
+/// Function tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionTool {
+    /// The type of the tool. Always `function`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub function: FunctionDefinition,
+}
+
+impl FunctionTool {
+    pub fn new(function: FunctionDefinition) -> Self {
+        Self {
+            r#type: "function".into(),
+            function,
+        }
+    }
+}
+
+impl Default for FunctionTool {
+    fn default() -> Self {
+        Self {
+            r#type: "function".into(),
+            function: Default::default(),
+        }
+    }
+}
+
+impl From<FunctionTool> for Tool {
+    fn from(value: FunctionTool) -> Self {
+        Self::Function(value)
+    }
+}
+
+/// Custom tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomTool {
+    /// The type of the tool. Always `custom`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub custom: CustomDefinition,
+}
+
+impl CustomTool {
+    pub fn new(custom: CustomDefinition) -> Self {
+        Self {
+            r#type: "custom".into(),
+            custom,
+        }
+    }
+}
+
+impl Default for CustomTool {
+    fn default() -> Self {
+        Self {
+            r#type: "tool".into(),
+            custom: Default::default(),
+        }
+    }
+}
+
+impl From<CustomTool> for Tool {
+    fn from(value: CustomTool) -> Self {
+        Self::Custom(value)
+    }
+}
+
+/// A function tool that can be used to generate a response.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
     /// The name of the function to be called.
     pub name: String,
     /// A description of what the function does, used by the model to choose when and how to call the function.
@@ -458,25 +526,17 @@ pub struct ToolFunction {
     pub strict: Option<bool>,
 }
 
-/// Tool choice.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ToolChoice {
-    /// `none` means the model will not call any tool and instead generates a message.
-    /// `auto` means the model can pick between generating a message or calling one or more tools.
-    /// `required` means the model must call one or more tools.
-    String,
-    /// Specifies a tool the model should use. Use to force the model to call a specific function.
-    Object(ToolChoiceObject),
-}
-
-/// Tool choice object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolChoiceObject {
-    /// The type of the tool.
-    #[serde(rename = "type")]
-    pub r#type: String,
-    pub function: FunctionCall,
+/// A custom tool that processes input using a specified format.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomDefinition {
+    /// The name of the custom tool, used to identify it in tool calls.
+    pub name: String,
+    /// Optional description of the custom tool, used to provide more context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The input format for the custom tool. Default is unconstrained text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
 }
 
 /// Stream options.
@@ -504,7 +564,6 @@ pub enum Role {
 
 /// Message.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Message {
     /// The role of the author of this message.
     pub role: Role,
@@ -523,31 +582,26 @@ pub struct Message {
     /// Tool call that this message is responding to. (tool message only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+
+    /// vLLM-specific fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
-    /// Checks if text content of a message is empty.
-    ///
-    /// The following messages are considered empty:
-    /// 1. [`Message::content`] is None.
-    /// 2. [`Message::content`] is an empty string.
-    /// 3. [`Message::content`] is an empty array.
-    /// 4. [`Message::content`] is an array of empty strings and ContentType is Text.
-    pub fn is_text_content_empty(&self) -> bool {
+    /// Returns message text content.
+    pub fn text(&self) -> Option<&String> {
         match &self.content {
-            Some(content) => match content {
-                Content::Text(string) => string.is_empty(),
-                Content::Array(content_parts) => {
-                    content_parts.is_empty()
-                        || content_parts.iter().all(|content_part| {
-                            content_part.text.is_none()
-                                || (content_part.r#type == ContentType::Text
-                                    && content_part.text.as_ref().unwrap().is_empty())
-                        })
-                }
-            },
-            None => true,
+            Some(Content::Text(text)) if !text.is_empty() => Some(text),
+            _ => None,
         }
+    }
+
+    /// Returns `true` if message contains non-empty content.
+    pub fn has_content(&self) -> bool {
+        self.content
+            .as_ref()
+            .is_some_and(|content| !content.is_empty())
     }
 }
 
@@ -559,6 +613,16 @@ pub enum Content {
     Text(String),
     /// Array of content parts.
     Array(Vec<ContentPart>),
+}
+
+impl Content {
+    /// Returns `true` if content is empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Content::Text(text) => text.is_empty(),
+            Content::Array(parts) => parts.is_empty() || parts.iter().all(|part| part.is_empty()),
+        }
+    }
 }
 
 impl From<String> for Content {
@@ -623,6 +687,19 @@ pub struct ContentPart {
     pub refusal: Option<String>,
 }
 
+impl ContentPart {
+    /// Returns `true` if the content text or image_url is empty.
+    pub fn is_empty(&self) -> bool {
+        match self.r#type {
+            ContentType::Text => self.text.as_ref().is_none_or(|text| text.is_empty()),
+            ContentType::ImageUrl => self
+                .image_url
+                .as_ref()
+                .is_none_or(|image_url| image_url.url.is_empty()),
+        }
+    }
+}
+
 /// Image url.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageUrl {
@@ -634,31 +711,45 @@ pub struct ImageUrl {
 }
 
 /// Tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
-    /// Index
+    /// Index (streaming)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
     /// The ID of the tool call.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    /// The type of the tool.
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// The type of the tool, "function" or "custom".
+    #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
+    pub r#type: String,
     /// The function that the model called.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<FunctionCall>,
+    pub function: Option<Function>,
+    /// The custom tool that the model called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<Custom>,
 }
 
-/// Function call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FunctionCall {
+/// Function.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Function {
     /// The name of the function to call.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// The arguments to call the function with, as generated by the model in JSON format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// Custom.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Custom {
+    /// The name of the custom tool to call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The input for the custom tool call generated by the model.
+    #[serde(default)]
+    pub input: String,
 }
 
 /// Chat completion response.
@@ -707,28 +798,13 @@ pub struct ChatCompletionChoice {
     /// The index of the choice in the list of choices.
     pub index: u32,
     /// A chat completion message generated by the model.
-    pub message: ChatCompletionMessage,
+    pub message: Message,
     /// Log probability information for the choice.
     pub logprobs: Option<ChatCompletionLogprobs>,
     /// The reason the model stopped generating tokens.
     pub finish_reason: String,
     /// The stop string or token id that caused the completion.
     pub stop_reason: Option<StopReason>,
-}
-
-/// Chat completion message.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ChatCompletionMessage {
-    /// The role of the author of this message.
-    pub role: Role,
-    /// The contents of the message.
-    pub content: Option<String>,
-    /// The tool calls generated by the model, such as function calls.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCall>,
-    /// The refusal message generated by the model.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refusal: Option<String>,
 }
 
 /// Chat completion logprobs.
@@ -968,21 +1044,103 @@ pub enum StopTokens {
     String(String),
 }
 
-/// OpenAI error response.
+/// Error response v1, for backwards compatability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAiError {
-    pub object: Option<String>,
+pub struct ErrorResponseV1 {
+    pub object: String,
     pub message: String,
     #[serde(rename = "type")]
-    pub r#type: Option<String>,
+    pub r#type: String,
     pub param: Option<String>,
     pub code: u16,
 }
 
-/// OpenAI streaming error message.
+/// Error response v2. vLLM >= v0.10.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAiErrorMessage {
-    pub error: OpenAiError,
+pub struct ErrorResponseV2 {
+    pub error: ErrorInfo,
+}
+
+/// Error info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorInfo {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub param: Option<String>,
+    pub code: u16,
+}
+
+/// Error response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ErrorResponse {
+    V1(ErrorResponseV1),
+    V2(ErrorResponseV2),
+}
+
+impl ErrorResponse {
+    pub fn new_v1(code: u16, message: String, r#type: String, param: Option<String>) -> Self {
+        Self::V1(ErrorResponseV1 {
+            object: "error".into(),
+            message,
+            r#type,
+            param,
+            code,
+        })
+    }
+
+    pub fn new_v2(code: u16, message: String, r#type: String, param: Option<String>) -> Self {
+        Self::V2(ErrorResponseV2 {
+            error: ErrorInfo {
+                message,
+                r#type,
+                param,
+                code,
+            },
+        })
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::V1(v1) => &v1.message,
+            Self::V2(v2) => &v2.error.message,
+        }
+    }
+
+    pub fn code(&self) -> u16 {
+        match self {
+            Self::V1(v1) => v1.code,
+            Self::V2(v2) => v2.error.code,
+        }
+    }
+}
+
+impl From<ErrorResponseV1> for ErrorResponse {
+    fn from(value: ErrorResponseV1) -> Self {
+        Self::V1(value)
+    }
+}
+
+impl From<ErrorResponseV2> for ErrorResponse {
+    fn from(value: ErrorResponseV2) -> Self {
+        Self::V2(value)
+    }
+}
+
+impl From<ErrorInfo> for ErrorResponse {
+    fn from(error: ErrorInfo) -> Self {
+        Self::V2(ErrorResponseV2 { error })
+    }
+}
+
+impl From<ErrorResponse> for Error {
+    fn from(value: ErrorResponse) -> Self {
+        Error::Http {
+            code: StatusCode::from_u16(value.code()).unwrap(),
+            message: value.message().into(),
+        }
+    }
 }
 
 /// Guardrails completion detections.
@@ -1059,6 +1217,7 @@ mod test {
                 stream: None,
                 model: "test".into(),
                 messages: messages.clone(),
+                tools: None,
                 extra,
             }
         );
@@ -1072,11 +1231,46 @@ mod test {
         assert_eq!(
             request,
             ChatCompletionsRequest {
-                detectors: DetectorConfig::default(),
-                stream: None,
                 model: "test".into(),
                 messages: messages.clone(),
-                extra: Map::new(),
+                ..Default::default()
+            }
+        );
+
+        // Test deserialize with tools
+        let json_request = json!({
+            "model": "test",
+            "messages": messages,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "example",
+                        "description": "a tool function",
+                        "parameters": {
+                            "p1": "a",
+                            "p2": "b",
+                        }
+                    }
+                }
+            ]
+        });
+        let request = ChatCompletionsRequest::deserialize(&json_request)?;
+        assert_eq!(
+            request,
+            ChatCompletionsRequest {
+                model: "test".into(),
+                messages: messages.clone(),
+                tools: Some(vec![Tool::Function(FunctionTool {
+                    r#type: "function".into(),
+                    function: FunctionDefinition {
+                        name: "example".into(),
+                        description: Some("a tool function".into()),
+                        parameters: [("p1".into(), "a".into()), ("p2".into(), "b".into())].into(),
+                        strict: None,
+                    },
+                })]),
+                ..Default::default()
             }
         );
 
@@ -1187,5 +1381,32 @@ mod test {
             choice.stop_reason,
             Some(StopReason::String("32007".to_string()))
         );
+    }
+
+    #[test]
+    fn test_deserialize_error_response() -> Result<(), serde_json::Error> {
+        let message = "This model's maximum context length is 32768 tokens. However, you requested 39197 tokens in the messages, Please reduce the length of the messages.";
+        let error_response_v1_json = json!({
+            "object": "error",
+            "message": message,
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400
+        });
+        let error_response = ErrorResponse::deserialize(&error_response_v1_json)?;
+        assert!(matches!(error_response, ErrorResponse::V1(_)));
+
+        let error_response_v2_json = json!({
+          "error": {
+            "message": message,
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400
+          }
+        });
+        let error_response = ErrorResponse::deserialize(&error_response_v2_json)?;
+        assert!(matches!(error_response, ErrorResponse::V2(_)));
+
+        Ok(())
     }
 }
