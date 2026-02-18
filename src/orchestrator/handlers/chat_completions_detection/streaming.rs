@@ -14,9 +14,9 @@
  limitations under the License.
 
 */
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, future::try_join_all};
 use opentelemetry::trace::TraceId;
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, instrument, warn};
@@ -31,13 +31,21 @@ use crate::{
     },
     orchestrator::{
         Context, Error,
-        common::{self, text_contents_detections, validate_detectors},
+        common::{self, group_detectors_by_type, validate_detectors},
         types::{
             ChatCompletionStream, ChatMessageIterator, Chunk, CompletionBatcher, CompletionState,
             Detection, DetectionBatchStream,
         },
     },
 };
+
+/// Timeout duration when waiting for completion state entries to become available.
+/// This handles the race condition where detectors respond faster than the LLM stream inserts completions.
+///
+/// The waiting mechanism uses cooperative yielding via `tokio::task::yield_now()`, not busy waiting.
+/// Each yield returns immediately in the normal case (microseconds), so this timeout only matters
+/// if the generation server is exceptionally slow or experiencing issues.
+const COMPLETION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn handle_streaming(
     ctx: Arc<Context>,
@@ -57,9 +65,20 @@ pub async fn handle_streaming(
             let output_detectors = detectors.output;
 
             if let Err(error) = validate_detectors(
-                input_detectors.iter().chain(output_detectors.iter()),
+                input_detectors.iter(),
                 &ctx.config.detectors,
                 &[DetectorType::TextContents],
+                true,
+            ) {
+                let _ = response_tx.send(Err(error)).await;
+                // Send None to signal completion
+                let _ = response_tx.send(Ok(None)).await;
+                return;
+            }
+            if let Err(error) = validate_detectors(
+                output_detectors.iter(),
+                &ctx.config.detectors,
+                &[DetectorType::TextContents, DetectorType::TextChat],
                 true,
             ) {
                 let _ = response_tx.send(Err(error)).await;
@@ -159,18 +178,16 @@ async fn handle_input_detection(
             "Last message role must be user, assistant, or system".into(),
         ));
     }
-    let input_id = message.index;
     let input_text = message.text.map(|s| s.to_string()).unwrap_or_default();
     let detections = match common::text_contents_detections(
         ctx.clone(),
         task.headers.clone(),
         detectors.clone(),
-        input_id,
         vec![(0, input_text.clone())],
     )
     .await
     {
-        Ok((_, detections)) => detections,
+        Ok(detections) => detections,
         Err(error) => {
             error!(%trace_id, %error, "task failed: error processing input detections");
             return Err(error);
@@ -227,17 +244,24 @@ async fn handle_output_detection(
 ) {
     let trace_id = task.trace_id;
     let request = task.request.clone();
-    // Split output detectors into 2 groups:
-    // 1) Output Detectors: Applied to chunks. Detections are returned in batches.
-    // 2) Whole Doc Output Detectors: Applied to concatenated chunks (whole doc) after the chat completion stream has been consumed.
-    // Currently, this is any detector that uses "whole_doc_chunker".
-    let (whole_doc_detectors, detectors): (HashMap<_, _>, HashMap<_, _>) =
+
+    // Split output detectors into two categories:
+    //
+    // chunk_detectors: detectors applied to generated text chunks, detections returned in batches.
+    // criteria: text_contents detectors using a chunker (not using whole_doc_chunker)
+    //
+    // whole_doc_detectors: detectors applied to full generated text (+prompt), detections returned with last message.
+    // criteria: text_contents detectors not using a chunker (whole_doc_chunker) and other supported detector types
+    let (chunk_detectors, whole_doc_detectors): (HashMap<_, _>, HashMap<_, _>) =
         detectors.into_iter().partition(|(detector_id, _)| {
-            ctx.config.get_chunker_id(detector_id).unwrap() == "whole_doc_chunker"
+            let config = ctx.config.detector(detector_id).unwrap();
+            matches!(config.r#type, DetectorType::TextContents)
+                && config.chunker_id != "whole_doc_chunker"
         });
+
     let completion_state = Arc::new(CompletionState::new());
 
-    if !detectors.is_empty() {
+    if !chunk_detectors.is_empty() {
         // Set up streaming detection pipeline
         // n represents how many choices to generate for each input message
         // Choices are processed independently so each choice has its own input channels and detection streams.
@@ -251,12 +275,12 @@ async fn handle_output_detection(
             input_rxs.insert(choice_index as u32, input_rx);
         });
         // Create detection streams
-        let mut detection_streams = Vec::with_capacity(n * detectors.len());
+        let mut detection_streams = Vec::with_capacity(n * chunk_detectors.len());
         for (choice_index, input_rx) in input_rxs {
             match common::text_contents_detection_streams(
                 ctx.clone(),
                 task.headers.clone(),
-                detectors.clone(),
+                chunk_detectors.clone(),
                 choice_index,
                 input_rx,
             )
@@ -282,8 +306,10 @@ async fn handle_output_detection(
             None,
         ));
         // Process detection streams and await completion
-        let detection_batch_stream =
-            DetectionBatchStream::new(CompletionBatcher::new(detectors.len()), detection_streams);
+        let detection_batch_stream = DetectionBatchStream::new(
+            CompletionBatcher::new(chunk_detectors.len()),
+            detection_streams,
+        );
         process_detection_batch_stream(
             trace_id,
             completion_state.clone(),
@@ -315,8 +341,8 @@ async fn handle_output_detection(
             ..Default::default()
         };
         if !whole_doc_detectors.is_empty() {
-            // Handle whole doc output detection
-            match handle_whole_doc_output_detection(
+            // Handle whole doc detection
+            match handle_whole_doc_detection(
                 ctx.clone(),
                 task,
                 whole_doc_detectors,
@@ -431,63 +457,112 @@ async fn process_chat_completion_stream(
 }
 
 #[instrument(skip_all)]
-async fn handle_whole_doc_output_detection(
+async fn handle_whole_doc_detection(
     ctx: Arc<Context>,
     task: &ChatCompletionsDetectionTask,
     detectors: HashMap<String, DetectorParams>,
     completion_state: Arc<CompletionState<ChatCompletionChunk>>,
 ) -> Result<(CompletionDetections, Vec<CompletionDetectionWarning>), Error> {
-    // Create vec of choice_index->inputs, where inputs contains the concatenated text for the choice
-    let choice_inputs = completion_state
+    use DetectorType::*;
+    let detector_groups = group_detectors_by_type(&ctx, detectors);
+    let headers = &task.headers;
+    let messages = task.request.messages.as_slice();
+    let tools = task.request.tools.as_ref().cloned().unwrap_or_default();
+    let mut warnings = Vec::new();
+
+    // Create vec of choice_index->message
+    // NOTE: we build a message from chat completion chunks as it is required for text chat detectors.
+    // Text contents detectors only require the content text.
+    let choices = completion_state
         .completions
         .iter()
         .map(|entry| {
             let choice_index = *entry.key();
-            let text = entry
-                .values()
-                .map(|chunk| {
-                    chunk
-                        .choices
-                        .first()
-                        .and_then(|choice| choice.delta.content.clone())
-                        .unwrap_or_default()
-                })
-                .collect::<String>();
-            let inputs = vec![(0usize, text)];
-            (choice_index, inputs)
+            let chunks = entry.values().cloned().collect::<Vec<_>>();
+            let tool_calls = merge_tool_calls(&chunks);
+            let content = merge_content(&chunks);
+            let message = Message {
+                role: Role::Assistant,
+                content,
+                tool_calls,
+                ..Default::default()
+            };
+            (choice_index, message)
         })
         .collect::<Vec<_>>();
-    // Process detections concurrently for choices
-    let choice_detections = stream::iter(choice_inputs)
-        .map(|(choice_index, inputs)| {
-            text_contents_detections(
-                ctx.clone(),
-                task.headers.clone(),
-                detectors.clone(),
-                choice_index,
-                inputs,
-            )
-        })
-        .buffer_unordered(ctx.config.detector_concurrent_requests)
-        .try_collect::<Vec<_>>()
-        .await?;
+
+    // Spawn detection tasks
+    let mut tasks = Vec::with_capacity(choices.len() * detector_groups.len());
+    for (choice_index, message) in &choices {
+        if !message.has_content() {
+            // Add no content warning
+            warnings.push(CompletionDetectionWarning::new(
+                DetectionWarningReason::EmptyOutput,
+                &format!("Choice of index {choice_index} has no content"),
+            ));
+        }
+        for (detector_type, detectors) in &detector_groups {
+            let detection_task = match detector_type {
+                TextContents => match message.text() {
+                    Some(content_text) => tokio::spawn(
+                        common::text_contents_detections(
+                            ctx.clone(),
+                            headers.clone(),
+                            detectors.clone(),
+                            vec![(0, content_text.clone())],
+                        )
+                        .in_current_span(),
+                    ),
+                    _ => continue, // no content, skip
+                },
+                TextChat => tokio::spawn(
+                    common::text_chat_detections(
+                        ctx.clone(),
+                        headers.clone(),
+                        detectors.clone(),
+                        [messages, std::slice::from_ref(message)].concat(),
+                        tools.clone(),
+                    )
+                    .in_current_span(),
+                ),
+                _ => unimplemented!(),
+            };
+            tasks.push((*choice_index, *detector_type, detection_task));
+        }
+    }
+
+    // Await completion of all detection tasks
+    let detections = try_join_all(tasks.into_iter().map(
+        |(choice_index, detector_type, detection_task)| async move {
+            Ok::<_, Error>((choice_index, detector_type, detection_task.await?))
+        },
+    ))
+    .await?
+    .into_iter()
+    .map(|(choice_index, detector_type, result)| {
+        result.map(|detections| (choice_index, detector_type, detections))
+    })
+    .collect::<Result<Vec<_>, Error>>()?;
+
+    // If there are any text contents detections, add unsuitable output warning
+    let unsuitable_output = detections.iter().any(|(_, detector_type, detections)| {
+        matches!(detector_type, DetectorType::TextContents) && !detections.is_empty()
+    });
+    if unsuitable_output {
+        warnings.push(CompletionDetectionWarning::new(
+            DetectionWarningReason::UnsuitableOutput,
+            UNSUITABLE_OUTPUT_MESSAGE,
+        ));
+    }
+
     // Build output detections
-    let output = choice_detections
+    let output = detections
         .into_iter()
-        .map(|(choice_index, detections)| CompletionOutputDetections {
+        .map(|(choice_index, _, detections)| CompletionOutputDetections {
             choice_index,
             results: detections,
         })
         .collect::<Vec<_>>();
-    // Build warnings
-    let warnings = if output.iter().any(|d| !d.results.is_empty()) {
-        vec![CompletionDetectionWarning::new(
-            DetectionWarningReason::UnsuitableOutput,
-            UNSUITABLE_OUTPUT_MESSAGE,
-        )]
-    } else {
-        Vec::new()
-    };
     let detections = CompletionDetections {
         output,
         ..Default::default()
@@ -496,14 +571,33 @@ async fn handle_whole_doc_output_detection(
 }
 
 /// Builds a response with output detections.
-fn output_detection_response(
+async fn output_detection_response(
     completion_state: &Arc<CompletionState<ChatCompletionChunk>>,
     choice_index: u32,
     chunk: Chunk,
     detections: Vec<Detection>,
 ) -> Result<ChatCompletionChunk, Error> {
-    // Get chat completions for this choice index
-    let chat_completions = completion_state.completions.get(&choice_index).unwrap();
+    // Wait for entry to exist (yields to other tasks until ready)
+    let chat_completions = {
+        let wait_for_entry = async {
+            loop {
+                if let Some(entry) = completion_state.completions.get(&choice_index) {
+                    return entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        match tokio::time::timeout(COMPLETION_WAIT_TIMEOUT, wait_for_entry).await {
+            Ok(entry) => entry,
+            Err(_) => {
+                return Err(Error::Other(format!(
+                    "completion entry for choice_index {} not ready after {:?} timeout",
+                    choice_index, COMPLETION_WAIT_TIMEOUT
+                )));
+            }
+        }
+    };
     // Get range of chat completions for this chunk
     let chat_completions = chat_completions
         .range(chunk.input_start_index..=chunk.input_end_index)
@@ -548,12 +642,12 @@ fn output_detection_response(
     }
 }
 
-/// Combines logprobs from chat completion chunks to a single [`ChatCompletionLogprobs`].
-fn merge_logprobs(chat_completions: &[ChatCompletionChunk]) -> Option<ChatCompletionLogprobs> {
+/// Builds [`ChatCompletionLogprobs`] from chat completion chunks containing logprobs.
+fn merge_logprobs(chunks: &[ChatCompletionChunk]) -> Option<ChatCompletionLogprobs> {
     let mut content: Vec<ChatCompletionLogprob> = Vec::new();
     let mut refusal: Vec<ChatCompletionLogprob> = Vec::new();
-    for chat_completion in chat_completions {
-        if let Some(choice) = chat_completion.choices.first()
+    for chunk in chunks {
+        if let Some(choice) = chunk.choices.first()
             && let Some(logprobs) = &choice.logprobs
         {
             content.extend_from_slice(&logprobs.content);
@@ -562,6 +656,72 @@ fn merge_logprobs(chat_completions: &[ChatCompletionChunk]) -> Option<ChatComple
     }
     (!content.is_empty() || !refusal.is_empty())
         .then_some(ChatCompletionLogprobs { content, refusal })
+}
+
+/// Builds [`Vec<ToolCall>`] from chat completion chunks containing tool call chunks.
+/// Builds tool calls from chat completion chunk deltas with tool call chunks.
+fn merge_tool_calls(chunks: &[ChatCompletionChunk]) -> Option<Vec<ToolCall>> {
+    let mut tool_calls: HashMap<usize, ToolCall> = HashMap::new();
+    for chunk in chunks {
+        if let Some(choice) = chunk.choices.first() {
+            for tc in &choice.delta.tool_calls {
+                let index = tc.index.unwrap();
+                let entry = tool_calls.entry(index).or_insert_with(|| ToolCall {
+                    index: Some(index),
+                    ..Default::default()
+                });
+                if !tc.id.is_empty() {
+                    // Set ID
+                    entry.id = tc.id.clone();
+                }
+                if let Some(function) = &tc.function {
+                    let f = entry.function.get_or_insert_default();
+                    if !function.name.is_empty() {
+                        // Set type to "function"
+                        entry.r#type = "function".into();
+                        // Set function name
+                        f.name = function.name.clone();
+                    }
+                    if !function.arguments.is_empty() {
+                        // Append function arguments
+                        f.arguments.push_str(&function.arguments);
+                    }
+                }
+                if let Some(custom) = &tc.custom {
+                    let c = entry.custom.get_or_insert_default();
+                    if !custom.name.is_empty() {
+                        // Set type to "custom"
+                        entry.r#type = "custom".into();
+                        // Set custom name
+                        c.name = custom.name.clone();
+                    }
+                    if !custom.input.is_empty() {
+                        // Append custom input
+                        c.input.push_str(&custom.input);
+                    }
+                }
+            }
+        }
+    }
+    let tool_calls = tool_calls
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    (!tool_calls.is_empty()).then_some(tool_calls)
+}
+
+/// Builds [`Content`] from chat completion chunks containing content chunks.
+fn merge_content(chunks: &[ChatCompletionChunk]) -> Option<Content> {
+    let content_text = chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .choices
+                .first()
+                .and_then(|choice| choice.delta.content.clone())
+        })
+        .collect::<String>();
+    (!content_text.is_empty()).then_some(Content::Text(content_text))
 }
 
 /// Consumes a detection batch stream, builds responses, and sends them to a response channel.
@@ -576,6 +736,7 @@ async fn process_detection_batch_stream(
             Ok((choice_index, chunk, detections)) => {
                 let input_end_index = chunk.input_end_index;
                 match output_detection_response(&completion_state, choice_index, chunk, detections)
+                    .await
                 {
                     Ok(chat_completion) => {
                         // Send chat completion to response channel
@@ -585,8 +746,29 @@ async fn process_detection_batch_stream(
                             return;
                         }
                         // If this is the final chat completion chunk with content, send chat completion chunk with finish reason
-                        let chat_completions =
-                            completion_state.completions.get(&choice_index).unwrap();
+                        // Wait for entry to exist (yields to other tasks until ready)
+                        let chat_completions = {
+                            let wait_for_entry = async {
+                                loop {
+                                    if let Some(entry) =
+                                        completion_state.completions.get(&choice_index)
+                                    {
+                                        return entry;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            };
+
+                            match tokio::time::timeout(COMPLETION_WAIT_TIMEOUT, wait_for_entry)
+                                .await
+                            {
+                                Ok(entry) => entry,
+                                Err(_) => {
+                                    error!(%trace_id, %choice_index, "completion entry not ready after {:?} timeout", COMPLETION_WAIT_TIMEOUT);
+                                    return;
+                                }
+                            }
+                        };
                         if chat_completions.keys().rev().nth(1) == Some(&input_end_index)
                             && let Some((_, chat_completion)) = chat_completions.last_key_value()
                             && chat_completion
@@ -622,4 +804,40 @@ async fn process_detection_batch_stream(
         }
     }
     info!(%trace_id, "task completed: detection batch stream closed");
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_merge_tool_calls() {
+        let chunks_json = serde_json::json!([
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"id":"chatcmpl-tool-17c2d16c3c734bd69235c88771175bf4","type":"function","index":0,"function":{"name":"get_current_weather"}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"location\": \""}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Boston"}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":","}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" MA\""}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":", \"unit\": \""}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"f"}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ahrenheit\"}"}}]},"logprobs":null,"finish_reason":null}]},
+            {"id":"chatcmpl-d20f671e9f9546858ed53274bd45836e","object":"chat.completion.chunk","created":1759439369,"model":"example","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]},"logprobs":null,"finish_reason":"tool_calls","stop_reason":128008}]},
+        ]);
+        let chunks = serde_json::from_value::<Vec<ChatCompletionChunk>>(chunks_json).unwrap();
+        let tool_calls = merge_tool_calls(&chunks);
+        assert_eq!(
+            tool_calls,
+            Some(vec![ToolCall {
+                index: Some(0),
+                id: "chatcmpl-tool-17c2d16c3c734bd69235c88771175bf4".into(),
+                r#type: "function".into(),
+                function: Some(Function {
+                    name: "get_current_weather".into(),
+                    arguments: "{\"location\": \"Boston, MA\", \"unit\": \"fahrenheit\"}".into(),
+                }),
+                custom: None,
+            }])
+        );
+    }
 }

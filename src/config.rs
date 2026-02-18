@@ -21,9 +21,12 @@ use std::{
 };
 
 use serde::Deserialize;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::clients::{chunker::DEFAULT_CHUNKER_ID, is_valid_hostname};
+use crate::{
+    clients::{chunker::DEFAULT_CHUNKER_ID, is_valid_hostname},
+    utils::from_env,
+};
 
 /// Default allowed headers to passthrough to clients.
 const DEFAULT_ALLOWED_HEADERS: &[&str] = &[];
@@ -70,6 +73,8 @@ pub struct ServiceConfig {
     pub hostname: String,
     /// Port for service
     pub port: Option<u16>,
+    /// Path prefix for service endpoints (e.g., "/namespace/service-name")
+    pub path_prefix: Option<String>,
     /// Timeout in seconds for request to be handled
     pub request_timeout: Option<u64>,
     /// TLS provider info
@@ -86,6 +91,9 @@ pub struct ServiceConfig {
     pub http2_keep_alive_interval: Option<u64>,
     /// Keep-alive timeout in seconds for client calls [currently only for grpc generation]
     pub keep_alive_timeout: Option<u64>,
+    /// Name of environment variable that contains the API key to use for this service [currently only for http generation]
+    #[serde(default, deserialize_with = "from_env")]
+    pub api_token: Option<String>,
 }
 
 impl ServiceConfig {
@@ -93,6 +101,7 @@ impl ServiceConfig {
         Self {
             hostname,
             port: Some(port),
+            path_prefix: None,
             request_timeout: None,
             tls: None,
             grpc_dns_probe_interval: None,
@@ -101,6 +110,7 @@ impl ServiceConfig {
             max_retries: None,
             http2_keep_alive_interval: None,
             keep_alive_timeout: None,
+            api_token: None,
         }
     }
 }
@@ -184,7 +194,7 @@ pub struct DetectorConfig {
     pub r#type: DetectorType,
 }
 
-#[derive(Default, Clone, Debug, Deserialize, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DetectorType {

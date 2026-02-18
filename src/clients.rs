@@ -212,6 +212,14 @@ pub async fn create_http_client(
         .set_port(Some(port))
         .unwrap_or_else(|_| panic!("error setting port: {port}"));
 
+    // Apply path prefix if configured
+    if let Some(prefix) = &service_config.path_prefix {
+        let trimmed = prefix.trim_matches('/');
+        if !trimmed.is_empty() {
+            base_url.set_path(&format!("/{}", trimmed));
+        }
+    }
+
     let connect_timeout = Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SEC);
     let request_timeout = Duration::from_secs(
         service_config
@@ -254,7 +262,11 @@ pub async fn create_http_client(
         .layer(http_trace_layer())
         .layer(TimeoutLayer::new(request_timeout))
         .service(client);
-    Ok(HttpClient::new(base_url, client))
+    Ok(HttpClient::new(
+        base_url,
+        service_config.api_token.clone(),
+        client,
+    ))
 }
 
 pub async fn create_grpc_client<C: Debug + Clone>(
