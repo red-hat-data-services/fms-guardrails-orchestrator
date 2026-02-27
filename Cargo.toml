@@ -53,7 +53,7 @@ opentelemetry-otlp = { version = "0.31.0", features = [
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio", "metrics"] }
 pin-project-lite = "0.2.16"
 prost = "0.14.1"
-reqwest = { version = "0.12.28", features = [
+reqwest = { version = "0.13.0", features = [
     "blocking",
     "rustls-tls",
     "json",
