@@ -3,7 +3,7 @@ ARG UBI_BASE_IMAGE_TAG=latest
 ARG PROTOC_VERSION=29.3
 ARG CONFIG_FILE=config/config.yaml
 ARG TARGETARCH
-ARG OPENSSL_VERSION=3.5.1-5.el9_7
+ARG OPENSSL_VERSION=3.5.1-7.el9_7
 
 ## Rust builder ################################################################
 FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS rust-builder
