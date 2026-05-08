@@ -62,7 +62,7 @@ jobs:
           echo "CACHE_LINT_TO=$CACHE_LINT_TO" >> $GITHUB_ENV
           echo "CACHE_FMT_TO=$CACHE_FMT_TO" >> $GITHUB_ENV
       - name: Test
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: tests
@@ -72,7 +72,7 @@ jobs:
           push: false
           platforms: linux/amd64
       - name: Lint with clippy
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: lint
@@ -82,7 +82,7 @@ jobs:
           push: false
           platforms: linux/amd64
       - name: Format
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: format
