@@ -91,7 +91,7 @@ tonic-prost = "0.14.2"
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.8", features = ["trace"] }
 tracing = "0.1.44"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.19.0", features = ["v4"] }
