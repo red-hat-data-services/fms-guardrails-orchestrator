@@ -1,0 +1,22 @@
+arches:
+  - x86_64
+  - aarch64
+  - ppc64le
+  - s390x
+contentOrigin:
+  repofiles:
+    - "./ubi.repo"
+packages:
+  - rust
+  - cargo
+  - gcc
+  - openssl-devel
+  - openssl-libs
+  - openssl
+  - unzip
+  - ca-certificates
+  - shadow-utils
+context:
+  containerfile:
+    file: "./Dockerfile.konflux"
+    stageName: rust-builder
