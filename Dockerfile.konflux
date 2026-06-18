@@ -1,13 +1,9 @@
 ARG UBI_MINIMAL_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal
 ARG UBI_BASE_IMAGE_TAG=latest
-ARG PROTOC_VERSION=29.3
 ARG CONFIG_FILE=config/config.yaml
-ARG TARGETARCH
 
 ## Rust builder ################################################################
 FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS rust-builder
-ARG PROTOC_VERSION
-ARG TARGETARCH
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
@@ -15,20 +11,11 @@ RUN microdnf install --disableplugin=subscription-manager -y \
         rust \
         cargo \
         gcc \
-        unzip \
+        g++ \
+        cmake \
         ca-certificates \
         openssl-devel && \
     microdnf clean all
-
-# Install protoc from prefetched generic deps
-RUN PROTOC_ARCH="" && \
-    if [ "$TARGETARCH" = "arm64" ]; then PROTOC_ARCH="aarch_64"; \
-    elif [ "$TARGETARCH" = "amd64" ]; then PROTOC_ARCH="x86_64"; \
-    elif [ "$TARGETARCH" = "s390x" ]; then PROTOC_ARCH="s390_64"; \
-    elif [ "$TARGETARCH" = "ppc64le" ]; then PROTOC_ARCH="ppcle_64"; \
-    else echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1; \
-    fi && \
-    unzip /cachi2/output/deps/generic/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip -d /usr/local
 
 WORKDIR /app
 
@@ -51,7 +38,7 @@ ENV CFLAGS="-Wno-string-compare"
 RUN cargo build --release
 # Copy test resources required for executing unit tests
 COPY tests/resources /app/tests/resources
-RUN cargo test -- --skip orchestrator::common::tasks::test::tests
+RUN cargo test --lib -- --skip orchestrator::common::tasks::test::tests
 
 ## Release Image ################################################################
 
