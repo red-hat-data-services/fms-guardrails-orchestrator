@@ -10,11 +10,12 @@ packages:
   - rust
   - cargo
   - gcc
+  - g++
+  - cmake
+  - ca-certificates
   - openssl-devel
   - openssl-libs
   - openssl
-  - unzip
-  - ca-certificates
   - shadow-utils
 context:
   containerfile:
