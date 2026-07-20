@@ -15,7 +15,9 @@ RUN microdnf --disableplugin=subscription-manager -y update && \
         unzip \
         ca-certificates \
         openssl-devel \
-        gcc && \
+        gcc \
+        gcc-c++ \
+        cmake && \
     microdnf clean all
 
 COPY rust-toolchain.toml rust-toolchain.toml

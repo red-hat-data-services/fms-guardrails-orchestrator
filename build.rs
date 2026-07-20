@@ -1,6 +1,8 @@
 use std::fs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: build scripts are single-threaded; no concurrent env access.
+    unsafe { std::env::set_var("PROTOC", protobuf_src::protoc()) };
     fs::create_dir("src/pb").unwrap_or(());
     tonic_prost_build::configure()
         .build_client(true)
