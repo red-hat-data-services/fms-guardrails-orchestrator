@@ -18,3 +18,8 @@ target/
 
 # Generated code by prost-build
 src/pb
+
+# Hermeto local testing artifacts
+.hermeto/
+.hermeto.env
+hermeto-test.json

@@ -99,6 +99,7 @@ uuid = { version = "1.19.0", features = ["v4"] }
 [build-dependencies]
 tonic-build = "0.14.2"
 tonic-prost-build = "0.14.2"
+protobuf-src = "2.1.1"
 
 [dev-dependencies]
 mocktail = { git = "https://github.com/IBM/mocktail", rev = "860e75e171a8eb818083813dbeed4401d1a40b3b" }
