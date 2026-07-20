@@ -49,9 +49,7 @@ COPY --from=fms-guardrails-orchestr8-builder /app/target/release/fms-guardrails-
 COPY ${CONFIG_FILE} /app/config/config.yaml
 
 RUN microdnf install -y --disableplugin=subscription-manager \
-        shadow-utils \
-        openssl-libs \
-        openssl && \
+        shadow-utils && \
     microdnf clean all --disableplugin=subscription-manager
 
 RUN groupadd --system orchestr8 --gid 1001 && \
