@@ -17,6 +17,8 @@ packages:
   - openssl-libs
   - openssl
   - shadow-utils
+upgradePackages:
+  - glibc
 context:
   containerfile:
     file: "./Dockerfile.konflux"
