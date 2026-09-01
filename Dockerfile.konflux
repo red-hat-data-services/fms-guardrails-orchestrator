@@ -42,7 +42,7 @@ RUN cargo test --lib -- --skip orchestrator::common::tasks::test::tests
 
 ## Release Image ################################################################
 
-FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS fms-guardrails-orchestr8-release
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest AS fms-guardrails-orchestr8-release
 ARG CONFIG_FILE=config/config.yaml
 
 COPY --from=fms-guardrails-orchestr8-builder /app/target/release/fms-guardrails-orchestr8 /app/bin/
