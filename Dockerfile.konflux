@@ -1,4 +1,4 @@
-ARG UBI_MINIMAL_BASE_IMAGE=registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736
+ARG UBI_MINIMAL_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal
 ARG UBI_BASE_IMAGE_TAG=latest
 ARG CONFIG_FILE=config/config.yaml
 
@@ -42,7 +42,7 @@ RUN cargo test --lib -- --skip orchestrator::common::tasks::test::tests
 
 ## Release Image ################################################################
 
-FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS fms-guardrails-orchestr8-release
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736 AS fms-guardrails-orchestr8-release
 ARG CONFIG_FILE=config/config.yaml
 
 COPY --from=fms-guardrails-orchestr8-builder /app/target/release/fms-guardrails-orchestr8 /app/bin/
