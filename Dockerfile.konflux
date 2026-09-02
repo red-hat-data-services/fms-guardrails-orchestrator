@@ -1,9 +1,8 @@
-ARG UBI_MINIMAL_BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal
-ARG UBI_BASE_IMAGE_TAG=latest
+ARG UBI_MINIMAL_BASE_IMAGE=registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736
 ARG CONFIG_FILE=config/config.yaml
 
 ## Rust builder ################################################################
-FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS rust-builder
+FROM ${UBI_MINIMAL_BASE_IMAGE} AS rust-builder
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
@@ -42,7 +41,7 @@ RUN cargo test --lib -- --skip orchestrator::common::tasks::test::tests
 
 ## Release Image ################################################################
 
-FROM ${UBI_MINIMAL_BASE_IMAGE}:${UBI_BASE_IMAGE_TAG} AS fms-guardrails-orchestr8-release
+FROM ${UBI_MINIMAL_BASE_IMAGE} AS fms-guardrails-orchestr8-release
 ARG CONFIG_FILE=config/config.yaml
 
 COPY --from=fms-guardrails-orchestr8-builder /app/target/release/fms-guardrails-orchestr8 /app/bin/
