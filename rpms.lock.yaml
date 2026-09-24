@@ -663,13 +663,13 @@ arches:
     name: glibc-devel
     evr: 2.34-275.el9_8
     sourcerpm: glibc-2.34-275.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/appstream/os/Packages/k/kernel-headers-5.14.0-687.50.1.el9_8.ppc64le.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/appstream/os/Packages/k/kernel-headers-5.14.0-687.51.1.el9_8.ppc64le.rpm
     repoid: ubi-9-for-ppc64le-appstream-rpms
-    size: 2932497
-    checksum: sha256:5b6aa1838d71417d7a49933f8813e8295a56284f9ec6d4398208637e756df4e7
+    size: 2943909
+    checksum: sha256:9f76ca5204046390a8514054f77cd2a2039c46853001e026faece81ec574e6b2
     name: kernel-headers
-    evr: 5.14.0-687.50.1.el9_8
-    sourcerpm: kernel-5.14.0-687.50.1.el9_8.src.rpm
+    evr: 5.14.0-687.51.1.el9_8
+    sourcerpm: kernel-5.14.0-687.51.1.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/ppc64le/appstream/os/Packages/l/libasan-11.5.0-14.el9.ppc64le.rpm
     repoid: ubi-9-for-ppc64le-appstream-rpms
     size: 440756
