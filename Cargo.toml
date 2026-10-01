@@ -100,6 +100,10 @@ uuid = { version = "1.18.1", features = ["v4"] }
 tonic-build = "0.14.2"
 tonic-prost-build = "0.14.2"
 
+[patch."https://github.com/gkumbhat/ginepro"]
+# CVE-2026-93657: use patched Hickory while preserving the fork's tonic 0.14 API.
+ginepro = { path = "vendor/ginepro" }
+
 [dev-dependencies]
 mocktail = { git = "https://github.com/IBM/mocktail", rev = "860e75e171a8eb818083813dbeed4401d1a40b3b" }
 rand = "0.9.2"

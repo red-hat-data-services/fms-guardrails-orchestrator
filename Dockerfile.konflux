@@ -63,6 +63,7 @@ COPY build.rs *.toml Cargo.lock LICENSE /app/
 COPY ${CONFIG_FILE} /app/config/config.yaml
 COPY protos/ /app/protos/
 COPY src/ /app/src/
+COPY vendor/ginepro/ /app/vendor/ginepro/
 COPY tests/ /app/tests/
 
 WORKDIR /app
