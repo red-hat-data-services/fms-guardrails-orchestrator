@@ -4,7 +4,7 @@ ARG TARGETARCH
 ARG OPENSSL_VERSION=3.5.8-1.el9_8
 
 ## Rust builder ################################################################
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:154811228435396156662801174566829a2c27d8a0b0f9af6e6d6e76ddf87ffe AS rust-builder
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:e8673bd338b3f093501a9a9088f043d8959df120edd9947583e2d9bb3aacc3a8 AS rust-builder
 ARG PROTOC_VERSION
 ARG TARGETARCH
 ARG OPENSSL_VERSION
@@ -77,7 +77,7 @@ RUN cargo test
 
 ## Release Image ################################################################
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:154811228435396156662801174566829a2c27d8a0b0f9af6e6d6e76ddf87ffe AS fms-guardrails-orchestr8-release
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:e8673bd338b3f093501a9a9088f043d8959df120edd9947583e2d9bb3aacc3a8 AS fms-guardrails-orchestr8-release
 ARG CONFIG_FILE=config/config.yaml
 ARG TARGETARCH
 ARG OPENSSL_VERSION
