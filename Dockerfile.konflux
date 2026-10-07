@@ -1,7 +1,7 @@
 ARG CONFIG_FILE=config/config.yaml
 
 ## Rust builder ################################################################
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:e8673bd338b3f093501a9a9088f043d8959df120edd9947583e2d9bb3aacc3a8 AS rust-builder
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:d34666200b64d5a183c867487fd2f48ee8547eb18134e5647099970e26f08af9 AS rust-builder
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
@@ -41,7 +41,7 @@ RUN cargo test --lib -- --skip orchestrator::common::tasks::test::tests
 
 ## Release Image ################################################################
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:e8673bd338b3f093501a9a9088f043d8959df120edd9947583e2d9bb3aacc3a8 AS fms-guardrails-orchestr8-release
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest@sha256:d34666200b64d5a183c867487fd2f48ee8547eb18134e5647099970e26f08af9 AS fms-guardrails-orchestr8-release
 ARG CONFIG_FILE=config/config.yaml
 
 COPY --from=fms-guardrails-orchestr8-builder /app/target/release/fms-guardrails-orchestr8 /app/bin/
