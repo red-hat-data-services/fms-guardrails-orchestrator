@@ -1,4 +1,4 @@
-ARG UBI_MINIMAL_BASE_IMAGE=registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:ddaf8f8a845a39f7ab7d7caaed1bed0b9063eab6e22e52beece0924e91666c86
+ARG UBI_MINIMAL_BASE_IMAGE=registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:d638f3b49b79575329aacdae2739f954effe2467c12147711e73445c4fc97819
 ARG CONFIG_FILE=config/config.yaml
 
 ## Rust builder ################################################################
